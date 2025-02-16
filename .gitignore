@@ -1,0 +1,7 @@
+*__pycache__*
+.env
+wandb/
+checkpoint_save_directory/
+collision_meshes/
+*.db
+rocket_learn.egg-info/
