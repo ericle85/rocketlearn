@@ -215,11 +215,8 @@ class PPO:
 
     @staticmethod
     @numba.njit
-    def _calculate_advantages_numba(rewards, values, gamma, gae_lambda, truncated):
+    def _calculate_advantages_numba(rewards, values, gamma, gae_lambda, terminated, truncated):
         advantages = np.zeros_like(rewards)
-        # v_targets = np.zeros_like(rewards)
-        dones = np.zeros_like(rewards)
-        dones[-1] = 1. if not truncated else 0.
         episode_starts = np.zeros_like(rewards)
         episode_starts[0] = 1.
         last_values = values[-1]
@@ -227,7 +224,9 @@ class PPO:
         size = len(advantages)
         for step in range(size - 1, -1, -1):
             if step == size - 1:
-                next_non_terminal = 1.0 - dones[-1].item()
+                # If terminated, don't bootstrap (next_non_terminal = 0)
+                # If truncated but not terminated, bootstrap (next_non_terminal = 1)
+                next_non_terminal = 1.0 - terminated[-1].item()
                 next_values = last_values
             else:
                 next_non_terminal = 1.0 - episode_starts[step + 1].item()
@@ -236,8 +235,7 @@ class PPO:
             delta = v_target - values[step]
             last_gae_lam = delta + gamma * gae_lambda * next_non_terminal * last_gae_lam
             advantages[step] = last_gae_lam
-            # v_targets[step] = v_target
-        return advantages  # , v_targets
+        return advantages
 
     def calculate(self, buffers: Iterator[ExperienceBuffer], iteration):
         """
@@ -273,11 +271,12 @@ class PPO:
             actions = np.stack(buffer.actions)
             log_probs = np.stack(buffer.log_probs)
             rewards = np.stack(buffer.rewards)
-            dones = np.stack(buffer.dones)
+            terminations = np.stack(buffer.terminated)
+            truncations = np.stack(buffer.truncated)
 
             size = rewards.shape[0]
 
-            advantages = self._calculate_advantages_numba(rewards, values, self.gamma, self.gae_lambda, dones[-1] == 2)
+            advantages = self._calculate_advantages_numba(rewards, values, self.gamma, self.gae_lambda, terminations, truncations)
 
             returns = advantages + values
 

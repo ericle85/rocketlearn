@@ -2,20 +2,17 @@ from typing import List
 
 import numpy as np
 import torch
-from rlgym.gym import Gym
-from rlgym.utils.reward_functions.common_rewards import ConstantReward
-from rlgym.utils.state_setters import DefaultState
+
+from rocket_learn.agent.pretrained_policy import HardcodedAgent
+from rocket_learn.utils.env_wrapper import RLGymV2GymWrapper
 from tqdm import tqdm
 
 from rocket_learn.agent.policy import Policy
-from rocket_learn.agent.pretrained_policy import HardcodedAgent
 from rocket_learn.experience_buffer import ExperienceBuffer
-from rocket_learn.utils.dynamic_gamemode_setter import DynamicGMSetter
-from rocket_learn.utils.truncated_condition import TruncatedCondition
+from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator
+from rlgym_tools.rocket_league.state_mutators.random_scoreboard_mutator import RandomScoreboardMutator
 
-
-def generate_episode(env: Gym, policies, evaluate=False, scoreboard=None, progress=False) -> (
-        List[ExperienceBuffer], int):
+def generate_episode(env: RLGymV2GymWrapper, policies, evaluate=False, scoreboard=None, progress=False) -> tuple[list[ExperienceBuffer], int]:
     """
     create experience buffer data by interacting with the environment(s)
     """
@@ -25,35 +22,52 @@ def generate_episode(env: Gym, policies, evaluate=False, scoreboard=None, progre
         progress = None
 
     if evaluate:  # Change setup temporarily to play a normal game (approximately)
-        from rlgym_tools.extra_terminals.game_condition import GameCondition  # tools is an optional dependency
-        terminals = env._match._terminal_conditions  # noqa
-        reward = env._match._reward_fn  # noqa
-        game_condition = GameCondition(tick_skip=env._match._tick_skip,  # noqa
-                                       seconds_per_goal_forfeit=10 * env._match._team_size,
-                                       max_overtime_seconds=300,
-                                       max_no_touch_seconds=60)
-        env._match._terminal_conditions = [game_condition]  # noqa
-        if isinstance(env._match._state_setter, DynamicGMSetter):  # noqa
-            state_setter = env._match._state_setter.setter  # noqa
-            env._match._state_setter.setter = DefaultState()  # noqa
-        else:
-            state_setter = env._match._state_setter  # noqa
-            env._match._state_setter = DefaultState()  # noqa
+        from rlgym.rocket_league.sim import RocketSimEngine
+        from rlgym.rocket_league.reward_functions.goal_reward import GoalReward
+        from rlgym.rocket_league.done_conditions import NoTouchTimeoutCondition, AnyCondition
 
-        env._match._reward_fn = ConstantReward()  # noqa Save some cpu cycles
+        from rlgym_tools.rocket_league.state_mutators.game_mutator import GameMutator
+        from eval_game_utils import GameCondition, ScoreboardInitMutator, KickoffOnGoalEngine
+
+        # Saving training env settings so we can reset back to them after eval
+        og_state_mutator = env.rlgym_env.state_mutator
+        og_reward_fn = env.rlgym_env.reward_fn
+        og_truncation_condition = env.rlgym_env.truncation_cond
+        og_termination_condition = env.rlgym_env.termination_cond
+        og_engine = env.rlgym_env.transition_engine
+
+        eval_transition_engine = KickoffOnGoalEngine(RocketSimEngine())
+        eval_state_mutator = MutatorSequence(
+            FixedTeamSizeMutator(),
+            ScoreboardInitMutator(),
+            GameMutator(),
+        )
+        eval_termination_condition = AnyCondition(
+            GameCondition(seconds_per_goal_forfeit=10 * len(env.rlgym_env.agents), max_overtime_seconds=300),
+        )
+        eval_truncation_condition = NoTouchTimeoutCondition(timeout_seconds=60)
+
+        env.rlgym_env.transition_engine = eval_transition_engine
+        env.rlgym_env.state_mutator = eval_state_mutator
+        env.rlgym_env.termination_cond = eval_termination_condition
+        env.rlgym_env.truncation_cond = eval_truncation_condition
+        env.rlgym_env.reward_fn = GoalReward()  # noqa
 
     if scoreboard is not None:
-        random_resets = scoreboard.random_resets
-        scoreboard.random_resets = not evaluate
-    observations, info = env.reset(return_info=True)
+        og_state_mutator = env.rlgym_env.state_mutator
+        if not evaluate:
+            env.rlgym_env.state_mutator = MutatorSequence(
+                RandomScoreboardMutator(),
+                env.rlgym_env.state_mutator
+            )
+    observations = env.reset()
+    last_state = env.rlgym_env.state
     result = 0
-
-    last_state = info['state']  # game_state for obs_building of other agents
 
     latest_policy_indices = [0 if isinstance(p, HardcodedAgent) else 1 for p in policies]
     # rollouts for all latest_policies
     rollouts = [
-        ExperienceBuffer(infos=[info])
+        ExperienceBuffer(infos=[])
         for _ in range(sum(latest_policy_indices))
     ]
 
@@ -64,17 +78,13 @@ def generate_episode(env: Gym, policies, evaluate=False, scoreboard=None, progre
             all_actions = []
             all_log_probs = []
 
-            # if observation isn't a list, make it one so we don't iterate over the observation directly
-            if not isinstance(observations, list):
-                observations = [observations]
-
             if not isinstance(policies[0], HardcodedAgent) and all(policy == policies[0] for policy in policies):
                 policy = policies[0]
                 if isinstance(observations[0], tuple):
                     obs = tuple(np.concatenate([obs[i] for obs in observations], axis=0)
                                 for i in range(len(observations[0])))
                 else:
-                    obs = np.concatenate(observations, axis=0)
+                    obs = observations
                 dist = policy.get_action_distribution(obs)
                 action_indices = policy.sample_action(dist)
                 log_probs = policy.log_prob(dist, action_indices)
@@ -116,7 +126,7 @@ def generate_episode(env: Gym, policies, evaluate=False, scoreboard=None, progre
 
                     index += 1
 
-            # to allow different action spaces, pad out short ones to longest length (assume later unpadding in parser)
+            # to allow different action spaces, pad out short ones to the longest length (assume later unpadding in parser)
             # length = max([a.shape[0] for a in all_actions])
             # padded_actions = []
             # for a in all_actions:
@@ -128,12 +138,7 @@ def generate_episode(env: Gym, policies, evaluate=False, scoreboard=None, progre
 
             all_actions = np.vstack(all_actions)
             old_obs = observations
-            observations, rewards, done, info = env.step(all_actions)
-
-            truncated = False
-            for terminal in env._match._terminal_conditions:  # noqa
-                if isinstance(terminal, TruncatedCondition):
-                    truncated |= terminal.is_truncated(info["state"])
+            observations, rewards, terminated, truncated, info = env.step(all_actions)
 
             if len(policies) <= 1:
                 observations, rewards = [observations], [rewards]
@@ -144,6 +149,10 @@ def generate_episode(env: Gym, policies, evaluate=False, scoreboard=None, progre
             rewards = [r for i, r in enumerate(rewards) if latest_policy_indices[i] == 1]
             all_log_probs = [r for i, r in enumerate(all_log_probs) if latest_policy_indices[i] == 1]
 
+            # Create lists for terminated and truncated to match other variables
+            terminated_list = [terminated] * len(old_obs)
+            truncated_list = [truncated] * len(old_obs)
+
             assert len(old_obs) == len(all_indices), str(len(old_obs)) + " obs, " + str(len(all_indices)) + " ind"
             assert len(old_obs) == len(rewards), str(len(old_obs)) + " obs, " + str(len(rewards)) + " ind"
             assert len(old_obs) == len(all_log_probs), str(len(old_obs)) + " obs, " + str(len(all_log_probs)) + " ind"
@@ -151,43 +160,40 @@ def generate_episode(env: Gym, policies, evaluate=False, scoreboard=None, progre
 
             # Might be different if only one agent?
             if not evaluate:  # Evaluation matches can be long, no reason to keep them in memory
-                for exp_buf, obs, act, rew, log_prob in zip(rollouts, old_obs, all_indices, rewards, all_log_probs):
-                    exp_buf.add_step(obs, act, rew, done + 2 * truncated, log_prob, info)
+                for exp_buf, obs, act, rew, term, trunc, log_prob in zip(rollouts, old_obs, all_indices, rewards,
+                                                                         terminated_list, truncated_list, all_log_probs):
+                    exp_buf.add_step(obs, act, rew, term, trunc, log_prob, info)
 
             if progress is not None:
                 progress.update()
-                igt = progress.n * env._match._tick_skip / 120  # noqa
+                igt = progress.n * 4 / 120  # TODO: Instead of hardcoding TS (4) maybe use the scoreboard?
+
                 prog_str = f"{igt // 60:02.0f}:{igt % 60:02.0f} IGT"
                 if evaluate:
                     prog_str += f", BLUE {b} - {o} ORANGE"
                 progress.set_postfix_str(prog_str)
 
-            if done or truncated:
-                result += info["result"]
-                if info["result"] > 0:
+            if env.rlgym_env.state.goal_scored:
+                if env.rlgym_env.state.scoring_team == 0:
                     b += 1
-                elif info["result"] < 0:
+                else:
                     o += 1
 
-                if not evaluate:
-                    break
-                elif game_condition.done:  # noqa
-                    break
-                else:
-                    observations, info = env.reset(return_info=True)
+            if terminated or truncated:
+                break
 
             last_state = info['state']
 
+    #TODO: Everything below here
     if scoreboard is not None:
-        scoreboard.random_resets = random_resets  # noqa Checked above
+        env.rlgym_env.state_mutator = og_state_mutator
 
     if evaluate:
-        if isinstance(env._match._state_setter, DynamicGMSetter):  # noqa
-            env._match._state_setter.setter = state_setter  # noqa
-        else:
-            env._match._state_setter = state_setter  # noqa
-        env._match._terminal_conditions = terminals  # noqa
-        env._match._reward_fn = reward  # noqa
+        env.rlgym_env.transition_engine = og_engine
+        env.rlgym_env.state_mutator = og_state_mutator
+        env.rlgym_env.termination_condition = og_termination_condition
+        env.rlgym_env.truncation_cond = og_truncation_condition
+        env.rlgym_env.reward_fn = og_reward_fn
         return result
 
     if progress is not None:

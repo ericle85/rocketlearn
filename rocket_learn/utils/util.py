@@ -3,8 +3,6 @@ from typing import Any
 import numpy as np
 import torch
 import torch.distributions
-from rlgym.utils.gamestates import GameState, PlayerData
-from rlgym.utils.obs_builders import AdvancedObs
 from torch import nn
 
 
@@ -26,13 +24,6 @@ class SplitLayer(nn.Module):
         return torch.split(x, self.splits, dim=-1)
 
 
-# TODO AdvancedObs should be supported by default, use stack instead of cat
-class ExpandAdvancedObs(AdvancedObs):
-    def build_obs(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> Any:
-        return np.reshape(
-            super(ExpandAdvancedObs, self).build_obs(player, state, previous_action),
-            (1, -1)
-        )
 
 
 def probability_NvsM(team1_ratings, team2_ratings, env=None):

@@ -10,8 +10,7 @@ import wandb
 # from matplotlib.figure import Figure
 from redis import Redis
 from redis.exceptions import ResponseError
-from rlgym.utils import ObsBuilder, RewardFunction
-from rlgym.utils.action_parsers import ActionParser
+from rlgym.api import ActionParser, ObsBuilder, RewardFunction
 from trueskill import Rating, rate, SIGMA
 
 from rocket_learn.experience_buffer import ExperienceBuffer
@@ -66,9 +65,9 @@ class RedisRolloutGenerator(BaseRolloutGenerator):
         self.save_freq = save_every
         self.model_freq = model_every
         self.contributors = Counter()  # No need to save, clears every iteration
-        self.obs_build_func = obs_build_factory
-        self.rew_func_factory = rew_func_factory
-        self.act_parse_factory = act_parse_factory
+        self.obs_build_func = obs_build_factory # Not being used currently
+        self.rew_func_factory = rew_func_factory # Not being used currently
+        self.act_parse_factory = act_parse_factory # Not being used currently
         self.max_age = max_age
         self.default_sigma = default_sigma
         self.min_sigma = min_sigma
@@ -77,7 +76,7 @@ class RedisRolloutGenerator(BaseRolloutGenerator):
         self._reset_stats()
 
     @staticmethod
-    def _process_rollout(rollout_bytes, latest_version, obs_build_func, rew_build_func, act_build_func, max_age):
+    def _process_rollout(rollout_bytes, latest_version, max_age):
         rollout_data, versions, uuid, name, result, has_obs, has_states, has_rewards = _unserialize(rollout_bytes)
 
         v_check = [v for v in versions if isinstance(v, int) or v.startswith("-")]
@@ -86,8 +85,7 @@ class RedisRolloutGenerator(BaseRolloutGenerator):
             return
 
         if any(version < 0 for version in v_check):
-            buffers, states = decode_buffers(rollout_data, versions, has_obs, has_states, has_rewards,
-                                             obs_build_func, rew_build_func, act_build_func)
+            buffers, states = decode_buffers(rollout_data, versions, has_obs, has_states, has_rewards)
         else:
             buffers = states = [None] * len(v_check)
 
@@ -162,7 +160,6 @@ class RedisRolloutGenerator(BaseRolloutGenerator):
             self.tot_bytes += len(data)
             res = self._process_rollout(
                 data, latest_version,
-                self.obs_build_func, self.rew_func_factory, self.act_parse_factory,
                 self.max_age
             )
             if res is not None:

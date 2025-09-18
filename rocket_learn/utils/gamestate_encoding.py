@@ -1,6 +1,6 @@
 from enum import Enum
 
-from rlgym.utils.gamestates import GameState
+from rlgym.rocket_league.api import GameState
 
 
 def encode_gamestate(state: GameState):

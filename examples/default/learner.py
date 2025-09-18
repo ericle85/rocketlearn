@@ -1,17 +1,19 @@
 import os
 import wandb
-import numpy
+import numpy as np
 from typing import Any
+from typing import List, Dict, Any, Tuple
 
 import torch.jit
 from torch.nn import Linear, Sequential, ReLU
 
 from redis import Redis
 
-from rlgym.utils.obs_builders.advanced_obs import AdvancedObs
-from rlgym.utils.gamestates import PlayerData, GameState
-from rlgym.utils.reward_functions.default_reward import DefaultReward
-from rlgym.utils.action_parsers.discrete_act import DiscreteAction
+from rlgym.rocket_league.obs_builders.default_obs import DefaultObs
+from rlgym.api import ObsBuilder, AgentID
+from rlgym.rocket_league.api import Car, GameState
+from rlgym.rocket_league.reward_functions import TouchReward
+from rlgym.rocket_league.action_parsers import LookupTableAction
 
 from rocket_learn.agent.actor_critic_agent import ActorCriticAgent
 from rocket_learn.agent.discrete_policy import DiscretePolicy
@@ -21,10 +23,14 @@ from rocket_learn.utils.util import SplitLayer
 
 
 # ROCKET-LEARN ALWAYS EXPECTS A BATCH DIMENSION IN THE BUILT OBSERVATION
-class ExpandAdvancedObs(AdvancedObs):
-    def build_obs(self, player: PlayerData, state: GameState, previous_action: numpy.ndarray) -> Any:
-        obs = super(ExpandAdvancedObs, self).build_obs(player, state, previous_action)
-        return numpy.expand_dims(obs, 0)
+class ExpandDefaultOBS(DefaultObs):
+    def build_obs(self, agents: List[AgentID], state: GameState, shared_info: Dict[str, Any]) -> Dict[
+        AgentID, np.ndarray]:
+        self._state = state
+        obs = {}
+        for agent in agents:
+            obs[agent] = np.expand_dims(self._build_obs(agent, state, shared_info), 0)
+        return obs
 
 
 if __name__ == "__main__":
@@ -37,23 +43,23 @@ if __name__ == "__main__":
 
     # ROCKET-LEARN USES WANDB WHICH REQUIRES A LOGIN TO USE. YOU CAN SET AN ENVIRONMENTAL VARIABLE
     # OR HARDCODE IT IF YOU ARE NOT SHARING YOUR SOURCE FILES
-    wandb.login(key=os.environ["WANDB_KEY"])
-    logger = wandb.init(project="demo", entity="wandb_username")
+    wandb.login(key=os.environ["WANDB_API_KEY"])
+    logger = wandb.init(project="demo", entity="leeric85")
     logger.name = "DEFAULT_LEARNER_EXAMPLE"
 
     # LINK TO THE REDIS SERVER YOU SHOULD HAVE RUNNING (USE THE SAME PASSWORD YOU SET IN THE REDIS
     # CONFIG)
-    redis = Redis(password="you_better_use_a_password")
+    redis = Redis(password=os.environ["REDIS_PASSWORD"])
 
     # ** ENSURE OBSERVATION, REWARD, AND ACTION CHOICES ARE THE SAME IN THE WORKER **
     def obs():
-        return ExpandAdvancedObs()
+        return DefaultObs()
 
     def rew():
-        return DefaultReward()
+        return TouchReward()
 
     def act():
-        return DiscreteAction()
+        return LookupTableAction()
 
 
     # THE ROLLOUT GENERATOR CAPTURES INCOMING DATA THROUGH REDIS AND PASSES IT TO THE LEARNER.
@@ -65,7 +71,7 @@ if __name__ == "__main__":
                                         logger=logger,
                                         save_every=100,
                                         model_every=100,
-                                        clear=False)
+                                        clear=True)
 
     # ROCKET-LEARN EXPECTS A SET OF DISTRIBUTIONS FOR EACH ACTION FROM THE NETWORK, NOT
     # THE ACTIONS THEMSELVES. SEE network_setup.readme.txt FOR MORE INFORMATION
@@ -116,7 +122,7 @@ if __name__ == "__main__":
         vf_coef=1,
         max_grad_norm=0.5,
         logger=logger,
-        device="cuda",
+        device="cpu",
     )
 
     # BEGIN TRAINING. IT WILL CONTINUE UNTIL MANUALLY STOPPED

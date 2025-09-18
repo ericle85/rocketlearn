@@ -4,7 +4,7 @@ from torch import nn
 
 from rocket_learn.agent.discrete_policy import DiscretePolicy
 
-from rlgym.utils.gamestates import GameState
+from rlgym.rocket_league.api.game_state import GameState
 
 
 class HardcodedAgent(ABC):

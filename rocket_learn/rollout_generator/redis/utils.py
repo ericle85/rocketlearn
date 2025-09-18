@@ -5,12 +5,11 @@ from typing import List, Optional, Union, Dict
 
 import numpy as np
 from redis import Redis
-from rlgym.utils.gamestates import GameState
 from trueskill import Rating
+from rlgym.api import ObsBuilder, RewardFunction, ActionParser
 
 from rocket_learn.experience_buffer import ExperienceBuffer
-from rocket_learn.utils.batched_obs_builder import BatchedObsBuilder
-from rocket_learn.utils.gamestate_encoding import encode_gamestate
+# from rocket_learn.utils.gamestate_encoding import encode_gamestate
 import msgpack
 import msgpack_numpy as m
 
@@ -73,12 +72,8 @@ def get_rating(gamemode: str, model_id: Optional[str], redis: Redis) -> Union[Ra
     return Rating(*_unserialize(redis.hget(quality_key, model_id)))
 
 
-def encode_buffers(buffers: List[ExperienceBuffer], return_obs=True, return_states=True, return_rewards=True):
+def encode_buffers(buffers: List[ExperienceBuffer], return_obs=True, return_rewards=True):
     res = []
-
-    if return_states:
-        states = np.asarray([encode_gamestate(info["state"]) for info in buffers[0].infos] if len(buffers) > 0 else [])
-        res.append(states)
 
     if return_obs:
         observations = [buffer.observations for buffer in buffers]
@@ -90,16 +85,20 @@ def encode_buffers(buffers: List[ExperienceBuffer], return_obs=True, return_stat
 
     actions = np.asarray([buffer.actions for buffer in buffers])
     log_probs = np.asarray([buffer.log_probs for buffer in buffers])
-    dones = np.asarray([buffer.dones for buffer in buffers])
+    terminated = np.asarray([buffer.terminated for buffer in buffers])
+    truncated = np.asarray([buffer.truncated for buffer in buffers])
     res.append(actions)
     res.append(log_probs)
-    res.append(dones)
+    res.append(terminated)
+    res.append(truncated)
 
     return res
 
-
-def decode_buffers(enc_buffers, versions, has_obs, has_states, has_rewards,
-                   obs_build_factory=None, rew_func_factory=None, act_parse_factory=None):
+# obs_build_factory is the obs builder
+# act_parse_factory is the act parser
+# rew_func_factory is the rew func
+def decode_buffers(enc_buffers, versions, has_obs, has_states, has_rewards):
+    assert has_obs, "Must have the obs"
     assert has_states or has_obs, "Must have at least one of obs or states"
     assert has_states or has_rewards, "Must have at least one of rewards or states"
     assert not has_obs or has_obs and has_rewards, "Must have both obs and rewards"  # TODO obs+no reward?
@@ -130,71 +129,14 @@ def decode_buffers(enc_buffers, versions, has_obs, has_states, has_rewards,
     i += 1
     log_probs = enc_buffers[i]
     i += 1
-    dones = enc_buffers[i]
+    terminated = enc_buffers[i]
+    i += 1
+    truncated = enc_buffers[i]
     i += 1
 
     if obs is None:
-        # Reconstruct observations
-        obs_builder = obs_build_factory()
-        act_parser = act_parse_factory()
-        if isinstance(obs_builder, BatchedObsBuilder):
-            # TODO support states+no rewards
-            assert game_states is not None and rewards is not None, "Must have both game states and rewards"
-            obs = obs_builder.batched_build_obs(game_states[:-1])
-            prev_actions = act_parser.parse_actions(actions.reshape((-1,) + actions.shape[2:]).copy(), None).reshape(
-                actions.shape[:2] + (8,))
-            prev_actions = np.concatenate((np.zeros((actions.shape[0], 1, 8)), prev_actions[:, :-1]), axis=1)
-            obs_builder.add_actions(obs, prev_actions)
-            buffers = [
-                ExperienceBuffer(observations=[obs[i]], actions=actions[i], rewards=rewards[i], dones=dones[i],
-                                 log_probs=log_probs[i])
-                for i in range(len(obs))
-            ]
-            return buffers, game_states
-        else:  # Slow reconstruction, but works for any ObsBuilder
-            gs_arrays = game_states
-            game_states = [GameState(gs.tolist()) for gs in game_states]
-            rew_func = rew_func_factory()
-            obs_builder.reset(game_states[0])
-            rew_func.reset(game_states[0])
-            buffers = [
-                ExperienceBuffer(infos=[{"state": game_states[0]}])
-                for _ in range(len(game_states[0].players))
-            ]
-
-            env_actions = [
-                act_parser.parse_actions(actions[:, s, :].copy(), game_states[s])
-                for s in range(actions.shape[1])
-            ]
-
-            obss = [obs_builder.build_obs(p, game_states[0], np.zeros(8))
-                    for i, p in enumerate(game_states[0].players)]
-            for s, gs in enumerate(game_states[1:]):
-                assert len(gs.players) == len(versions)
-                final = s == len(game_states) - 2
-                old_obs = obss
-                obss = []
-                i = 0
-                for version in versions:
-                    if version == 'na':
-                        continue  # don't want to rebuild or use prebuilt agents
-                    player = gs.players[i]
-
-                    # IF ONLY 1 buffer is returned, need a way to say to discard bad version
-
-                    obs = obs_builder.build_obs(player, gs, env_actions[s][i])
-                    if rewards is None:
-                        if final:
-                            rew = rew_func.get_final_reward(player, gs, env_actions[s][i])
-                        else:
-                            rew = rew_func.get_reward(player, gs, env_actions[s][i])
-                    else:
-                        rew = rewards[i][s]
-                    buffers[i].add_step(old_obs[i], actions[i][s], rew, final, log_probs[i][s], {"state": gs})
-                    obss.append(obs)
-                i += 1
-
-            return buffers, gs_arrays
+        # TODO: Fix GameState construction for RLGym v2, No batch OBS builder yet
+        raise NotImplementedError("GameState reconstruction not yet implemented for RLGym v2")
     else:  # We have everything we need
         buffers = []
         for i in range(len(obs)):
@@ -202,7 +144,8 @@ def decode_buffers(enc_buffers, versions, has_obs, has_states, has_rewards,
                 ExperienceBuffer(observations=obs[i],
                                  actions=actions[i],
                                  rewards=rewards[i],
-                                 dones=dones[i],
+                                 terminated=terminated[i],
+                                 truncated=truncated[i],
                                  log_probs=log_probs[i])
             )
         return buffers, game_states

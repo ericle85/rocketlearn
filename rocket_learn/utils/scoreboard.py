@@ -3,9 +3,9 @@ import random
 
 import numpy as np
 from numpy.random import poisson
-from rlgym.utils.common_values import BACK_WALL_Y, SIDE_WALL_X, GOAL_HEIGHT
+from rlgym.rocket_league.common_values import BACK_WALL_Y, SIDE_WALL_X, GOAL_HEIGHT
 
-from rlgym.utils.gamestates import GameState
+from rlgym.rocket_league.api import GameState
 
 TICKS_PER_SECOND = 120
 SECONDS_PER_MINUTE = 60
