@@ -15,8 +15,9 @@ from rlgym_tools.rocket_league.renderers.rocketsimvis_renderer import RocketSimV
 from rlgym.rocket_league import common_values
 from rocket_learn.rollout_generator.redis.redis_rollout_worker import RedisRolloutWorker
 from rlgym_tools.rocket_league.reward_functions.velocity_player_to_ball_reward import VelocityPlayerToBallReward
+from rlgym_tools.rocket_league.state_mutators.random_physics_mutator import RandomPhysicsMutator
 
-
+from rewards.common_rewards import FaceBallReward
 if __name__ == "__main__":
     """
 
@@ -36,18 +37,18 @@ if __name__ == "__main__":
     spawn_opponents = True
     team_size = 1
     action_repeat = 8
-    no_touch_timeout_seconds = 30
+    no_touch_timeout_seconds = 10
     game_timeout_seconds = 300
     action_parser = RepeatAction(LookupTableAction(), repeats=action_repeat)
     termination_condition = GoalCondition()
     truncation_condition = AnyCondition(NoTouchTimeoutCondition(timeout_seconds=no_touch_timeout_seconds),
                                         TimeoutCondition(timeout_seconds=game_timeout_seconds))
 
-    reward_fn = CombinedReward((GoalReward(), 10), (TouchReward(), 0.1))
+    reward_fn = CombinedReward((FaceBallReward(), 1), (TouchReward(), 50), (VelocityPlayerToBallReward(include_negative_values=False), 5))
 
     obs_builder = DefaultObs()
 
-    state_mutator = MutatorSequence(KickoffMutator()) # DO NOT INCLUDE TEAMSIZE MUTATOR YET
+    state_mutator = MutatorSequence(RandomPhysicsMutator()) # DO NOT INCLUDE TEAMSIZE MUTATOR YET
     
     # BUILD THE ROCKET LEAGUE MATCH THAT WILL BE USED FOR TRAINING
     # -ENSURE OBSERVATION, REWARD, AND ACTION CHOICES ARE THE SAME IN THE WORKER
@@ -68,7 +69,7 @@ if __name__ == "__main__":
 
     # LAUNCH ROCKET LEAGUE AND BEGIN TRAINING
     # -past_version_prob SPECIFIES HOW OFTEN OLD VERSIONS WILL BE RANDOMLY SELECTED AND TRAINED AGAINST
-    RedisRolloutWorker(r, "example-2", env, device,
+    RedisRolloutWorker(r, "example", env, device,
                        past_version_prob=.2,
                        evaluation_prob=0.01,
                        sigma_target=2,

@@ -52,6 +52,7 @@ if __name__ == "__main__":
     redis = Redis(password=os.environ["REDIS_PASSWORD"])
 
     # ** ENSURE OBSERVATION, REWARD, AND ACTION CHOICES ARE THE SAME IN THE WORKER **
+    # NOT BEING USED CURRENTLY
     def obs():
         return DefaultObs()
 
@@ -90,8 +91,8 @@ if __name__ == "__main__":
 
     # CREATE THE OPTIMIZER
     optim = torch.optim.Adam([
-        {"params": actor.parameters(), "lr": 5e-5},
-        {"params": critic.parameters(), "lr": 5e-5}
+        {"params": actor.parameters(), "lr": 1e-4},
+        {"params": critic.parameters(), "lr": 1e-4}
     ])
 
     # PPO REQUIRES AN ACTOR/CRITIC AGENT

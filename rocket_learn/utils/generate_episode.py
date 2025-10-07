@@ -166,7 +166,7 @@ def generate_episode(env: RLGymV2GymWrapper, policies, evaluate=False, scoreboar
 
             if progress is not None:
                 progress.update()
-                igt = progress.n * 4 / 120  # TODO: Instead of hardcoding TS (4) maybe use the scoreboard?
+                igt = progress.n * 8 / 120  # TODO: Instead of hardcoding TS (4) maybe use the scoreboard?
 
                 prog_str = f"{igt // 60:02.0f}:{igt % 60:02.0f} IGT"
                 if evaluate:
