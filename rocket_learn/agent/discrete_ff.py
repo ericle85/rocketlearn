@@ -104,5 +104,5 @@ class DiscreteFF(Policy):
 
     def env_compatible(self, action):
         if isinstance(action, torch.Tensor):
-            action = action.numpy()
+            action = action.cpu().numpy()
         return action

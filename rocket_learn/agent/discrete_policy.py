@@ -67,5 +67,5 @@ class DiscretePolicy(Policy):
 
     def env_compatible(self, action):
         if isinstance(action, th.Tensor):
-            action = action.numpy()
+            action = action.cpu().numpy()
         return action

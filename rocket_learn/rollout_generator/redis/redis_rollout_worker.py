@@ -45,7 +45,7 @@ class RedisRolloutWorker:
      :param gamemode_weights: dict of dynamic gamemode choice weights. If None, default equal experience
     """
 
-    def __init__(self, redis: Redis, name: str, env: RLGym,
+    def __init__(self, redis: Redis, name: str, env: RLGym, device : str,
                  past_version_prob=.2, evaluation_prob=0.01, sigma_target=1,
                  dynamic_gm=True, team_size = 0 ,streamer_mode=False, send_gamestates=True, # This will be irrelevant
                  send_obs=True, scoreboard=None, pretrained_agents=None,
@@ -55,6 +55,7 @@ class RedisRolloutWorker:
         # TODO model or config+params so workers can recreate just from redis connection?
         self.redis = redis
         self.name = name
+        self.device = device
 
         assert send_gamestates or send_obs, "Must have at least one of obs or states"
         assert dynamic_gm or team_size > 0, "Team sizes must be at least 1 or have dynamic_gm set to true"
@@ -73,7 +74,7 @@ class RedisRolloutWorker:
 
         self.streamer_mode = streamer_mode
 
-        self.current_agent = _unserialize_model(self.redis.get(MODEL_LATEST))
+        self.current_agent = _unserialize_model(self.redis.get(MODEL_LATEST), device=device)
 
         self.past_version_prob = past_version_prob
         self.evaluation_prob = evaluation_prob
@@ -221,7 +222,7 @@ class RedisRolloutWorker:
             models = self.sql.execute("SELECT parameters FROM MODELS WHERE id == ?", (version,)).fetchall()
             if len(models) == 0:
                 bytestream = self.redis.hget(OPPONENT_MODELS, version)
-                model = _unserialize_model(bytestream)
+                model = _unserialize_model(bytestream, self.device)
 
                 self.sql.execute('INSERT INTO MODELS (id, parameters) VALUES (?, ?)', (version, bytestream))
                 self.sql.commit()
@@ -232,9 +233,9 @@ class RedisRolloutWorker:
                 assert len(models[0]) == 1
 
                 bytestream = models[0][0]
-                model = _unserialize_model(bytestream)
+                model = _unserialize_model(bytestream, self.device)
         else:
-            model = _unserialize_model(self.redis.hget(OPPONENT_MODELS, version))
+            model = _unserialize_model(self.redis.hget(OPPONENT_MODELS, version), self.device)
 
         return model
 
@@ -316,7 +317,7 @@ class RedisRolloutWorker:
                     time.sleep(1)
                     continue  # This is maybe not necessary? Can't hurt to leave it in.
                 latest_version = available_version
-                updated_agent = _unserialize_model(model_bytes)
+                updated_agent = _unserialize_model(model_bytes, self.device)
                 self.current_agent = updated_agent
 
             n += 1

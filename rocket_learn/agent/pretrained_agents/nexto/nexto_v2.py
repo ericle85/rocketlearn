@@ -75,7 +75,7 @@ class NextoV2(HardcodedAgent):
         )
 
         actions = np.argmax(logits, axis=-1)
-        parsed = self._lookup_table[actions.numpy().item()]
+        parsed = self._lookup_table[actions.cpu().numpy().item()]
 
         self.previous_action = parsed
         return parsed

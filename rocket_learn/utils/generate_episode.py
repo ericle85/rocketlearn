@@ -90,9 +90,9 @@ def generate_episode(env: RLGymV2GymWrapper, policies, evaluate=False, scoreboar
                 log_probs = policy.log_prob(dist, action_indices)
                 actions = policy.env_compatible(action_indices)
 
-                all_indices.extend(list(action_indices.numpy()))
+                all_indices.extend(list(action_indices.cpu().numpy()))
                 all_actions.extend(list(actions))
-                all_log_probs.extend(list(log_probs.numpy()))
+                all_log_probs.extend(list(log_probs.cpu().numpy()))
             else:
                 index = 0
                 for policy, obs in zip(policies, observations):
@@ -116,7 +116,7 @@ def generate_episode(env: RLGymV2GymWrapper, policies, evaluate=False, scoreboar
                         log_probs = policy.log_prob(dist, action_indices).item()
                         actions = policy.env_compatible(action_indices)
 
-                        all_indices.append(action_indices.numpy())
+                        all_indices.append(action_indices.cpu().numpy())
                         all_actions.append(actions)
                         all_log_probs.append(log_probs)
 

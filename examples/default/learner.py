@@ -76,7 +76,7 @@ if __name__ == "__main__":
     # TOTAL SIZE OF THE INPUT DATA
     state_dim = 172
     n_actions = 90
-    device = "cpu"
+    device = "cuda"
 
     critic = Sequential(
         Linear(state_dim, 256),

@@ -50,8 +50,14 @@ def _serialize_model(mdl):
     return mdl_bytes
 
 
-def _unserialize_model(buf):
+def _unserialize_model(buf, device: str):
+    import torch
     agent = pickle.loads(buf)
+    device_obj = torch.device(device)
+    agent.to(device_obj)
+    # Update the device attribute if it exists
+    if hasattr(agent, 'device'):
+        agent.device = device_obj
     return agent
 
 

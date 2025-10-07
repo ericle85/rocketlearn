@@ -32,6 +32,7 @@ if __name__ == "__main__":
 
     torch.set_num_threads(1)
 
+    device = "cpu"
     spawn_opponents = True
     team_size = 1
     action_repeat = 8
@@ -67,7 +68,7 @@ if __name__ == "__main__":
 
     # LAUNCH ROCKET LEAGUE AND BEGIN TRAINING
     # -past_version_prob SPECIFIES HOW OFTEN OLD VERSIONS WILL BE RANDOMLY SELECTED AND TRAINED AGAINST
-    RedisRolloutWorker(r, "example", env,
+    RedisRolloutWorker(r, "example-2", env, device,
                        past_version_prob=.2,
                        evaluation_prob=0.01,
                        sigma_target=2,
