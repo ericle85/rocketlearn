@@ -9,18 +9,17 @@ import sqlite3 as sql
 
 import numpy as np
 from redis import Redis
-from rlgym.envs import Match
-from rlgym.gamelaunch import LaunchPreference
-from rlgym.gym import Gym
+from rlgym.api import RLGym
 from tabulate import tabulate
 
-import rocket_learn.agent.policy
 import rocket_learn.utils.generate_episode
+from rocket_learn.utils.env_wrapper import RLGymV2GymWrapper
+from rlgym.rocket_league.state_mutators import MutatorSequence
+from rlgym_tools.rocket_league.state_mutators.variable_team_size_mutator import VariableTeamSizeMutator
 from rocket_learn.rollout_generator.redis.utils import _unserialize_model, MODEL_LATEST, WORKER_IDS, OPPONENT_MODELS, \
     VERSION_LATEST, _serialize, ROLLOUTS, encode_buffers, get_rating, LATEST_RATING_ID, \
     EXPERIENCE_PER_MODE
 from rocket_learn.utils.util import probability_NvsM
-from rocket_learn.utils.dynamic_gamemode_setter import DynamicGMSetter
 
 
 class RedisRolloutWorker:
@@ -46,11 +45,11 @@ class RedisRolloutWorker:
      :param gamemode_weights: dict of dynamic gamemode choice weights. If None, default equal experience
     """
 
-    def __init__(self, redis: Redis, name: str, match: Match,
+    def __init__(self, redis: Redis, name: str, env: RLGym,
                  past_version_prob=.2, evaluation_prob=0.01, sigma_target=1,
-                 dynamic_gm=True, streamer_mode=False, send_gamestates=True,
+                 dynamic_gm=True, team_size = 0 ,streamer_mode=False, send_gamestates=True, # This will be irrelevant
                  send_obs=True, scoreboard=None, pretrained_agents=None,
-                 human_agent=None, force_paging=False, auto_minimize=True,
+                 human_agent=None,
                  local_cache_name=None, gamemode_weights=None, full_team_evaluations=False,
                  live_progress=True):
         # TODO model or config+params so workers can recreate just from redis connection?
@@ -58,6 +57,7 @@ class RedisRolloutWorker:
         self.name = name
 
         assert send_gamestates or send_obs, "Must have at least one of obs or states"
+        assert dynamic_gm or team_size > 0, "Team sizes must be at least 1 or have dynamic_gm set to true"
 
         self.pretrained_agents = {}
         self.pretrained_total_prob = 0
@@ -81,6 +81,8 @@ class RedisRolloutWorker:
         self.send_gamestates = send_gamestates
         self.send_obs = send_obs
         self.dynamic_gm = dynamic_gm
+        self.team_size = team_size
+        self.team_size_mutator = VariableTeamSizeMutator(mode_weights={})
         self.gamemode_weights = gamemode_weights
         if self.gamemode_weights is not None:
             assert np.isclose(sum(self.gamemode_weights.values()), 1), "gamemode_weights must sum to 1"
@@ -112,12 +114,8 @@ class RedisRolloutWorker:
             print("Streaming mode set. Running silent.")
 
         self.scoreboard = scoreboard
-        state_setter = DynamicGMSetter(match._state_setter)  # noqa Rangler made me do it
-        self.set_team_size = state_setter.set_team_size
-        match._state_setter = state_setter
-        self.match = match
-        self.env = Gym(match=self.match, pipe_id=os.getpid(), launch_preference=LaunchPreference.EPIC,
-                       use_injector=True, force_paging=force_paging, raise_on_crash=True, auto_minimize=auto_minimize)
+        self.env = env
+        # TODO state setter already set 
         self.total_steps_generated = 0
 
     def _get_opponent_ids(self, n_new, n_old, pretrained_choice):
@@ -327,28 +325,21 @@ class RedisRolloutWorker:
             evaluate = np.random.random() < self.evaluation_prob
 
             if self.dynamic_gm:
-                blue, orange = self.select_gamemode(equal_likelihood=evaluate or self.streamer_mode)
-            elif self.match._spawn_opponents is False:
-                blue = self.match.agents
-                orange = 0
+                blue, orange = self.select_gamemode(equal_likelihood=evaluate or self.streamer_mode) 
             else:
-                blue = orange = self.match.agents // 2
-            self.set_team_size(blue, orange)
+                blue = orange = self.team_size
 
-            if self.human_agent:
-                n_new = blue + orange - 1
-                versions = ['na']
+            self.team_size_mutator.mode_weights = {
+               (blue, orange): 1
+            }
 
-                agents = [self.human_agent]
-                for n in range(n_new):
-                    agents.append(self.current_agent)
-                    versions.append(-1)
-
-                versions = [v if v != -1 else latest_version for v in versions]
-                ratings = ["na"] * len(versions)
-            else:
-                # TODO customizable past agent selection, should team only be same agent?
-                agents, pretrained_choice, versions, ratings = self._generate_matchup(blue + orange,
+            if isinstance(self.env, RLGym):
+                # Not wrapped yet
+                self.env.state_mutator = MutatorSequence(self.team_size_mutator, self.env.state_mutator)
+                self.env = RLGymV2GymWrapper(self.env)
+            
+            
+            agents, pretrained_choice, versions, ratings = self._generate_matchup(blue + orange,
                                                                                       latest_version,
                                                                                       pretrained_choice,
                                                                                       evaluate)

@@ -27,7 +27,7 @@ def generate_episode(env: RLGymV2GymWrapper, policies, evaluate=False, scoreboar
         from rlgym.rocket_league.done_conditions import NoTouchTimeoutCondition, AnyCondition
 
         from rlgym_tools.rocket_league.state_mutators.game_mutator import GameMutator
-        from eval_game_utils import GameCondition, ScoreboardInitMutator, KickoffOnGoalEngine
+        from rocket_learn.utils.eval_game_utils import GameCondition, ScoreboardInitMutator, KickoffOnGoalEngine
 
         # Saving training env settings so we can reset back to them after eval
         og_state_mutator = env.rlgym_env.state_mutator
@@ -38,7 +38,7 @@ def generate_episode(env: RLGymV2GymWrapper, policies, evaluate=False, scoreboar
 
         eval_transition_engine = KickoffOnGoalEngine(RocketSimEngine())
         eval_state_mutator = MutatorSequence(
-            FixedTeamSizeMutator(),
+            FixedTeamSizeMutator(), # This is still always set to 1v1
             ScoreboardInitMutator(),
             GameMutator(),
         )
@@ -191,7 +191,7 @@ def generate_episode(env: RLGymV2GymWrapper, policies, evaluate=False, scoreboar
     if evaluate:
         env.rlgym_env.transition_engine = og_engine
         env.rlgym_env.state_mutator = og_state_mutator
-        env.rlgym_env.termination_condition = og_termination_condition
+        env.rlgym_env.termination_cond = og_termination_condition
         env.rlgym_env.truncation_cond = og_truncation_condition
         env.rlgym_env.reward_fn = og_reward_fn
         return result

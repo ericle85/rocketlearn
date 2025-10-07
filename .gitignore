@@ -1,1 +1,6 @@
 *__pycache__*
+wandb/
+checkpoint_save_directory/
+rocket_learn.egg-info/
+*db
+.idea*

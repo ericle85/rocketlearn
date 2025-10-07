@@ -16,7 +16,7 @@ from rlgym.rocket_league.reward_functions import TouchReward
 from rlgym.rocket_league.action_parsers import LookupTableAction
 
 from rocket_learn.agent.actor_critic_agent import ActorCriticAgent
-from rocket_learn.agent.discrete_policy import DiscretePolicy
+from rocket_learn.agent.discrete_ff import DiscreteFF
 from rocket_learn.ppo import PPO
 from rocket_learn.rollout_generator.redis.redis_rollout_generator import RedisRolloutGenerator
 from rocket_learn.utils.util import SplitLayer
@@ -73,13 +73,10 @@ if __name__ == "__main__":
                                         model_every=100,
                                         clear=True)
 
-    # ROCKET-LEARN EXPECTS A SET OF DISTRIBUTIONS FOR EACH ACTION FROM THE NETWORK, NOT
-    # THE ACTIONS THEMSELVES. SEE network_setup.readme.txt FOR MORE INFORMATION
-    split = (3, 3, 3, 3, 3, 2, 2, 2)
-    total_output = sum(split)
-
     # TOTAL SIZE OF THE INPUT DATA
-    state_dim = 107
+    state_dim = 172
+    n_actions = 90
+    device = "cpu"
 
     critic = Sequential(
         Linear(state_dim, 256),
@@ -89,14 +86,7 @@ if __name__ == "__main__":
         Linear(256, 1)
     )
 
-    actor = DiscretePolicy(Sequential(
-        Linear(state_dim, 256),
-        ReLU(),
-        Linear(256, 256),
-        ReLU(),
-        Linear(256, total_output),
-        SplitLayer(splits=split)
-    ), split)
+    actor =  DiscreteFF(state_dim,n_actions,[256, 256, 256], device)
 
     # CREATE THE OPTIMIZER
     optim = torch.optim.Adam([
@@ -122,7 +112,7 @@ if __name__ == "__main__":
         vf_coef=1,
         max_grad_norm=0.5,
         logger=logger,
-        device="cpu",
+        device=device,
     )
 
     # BEGIN TRAINING. IT WILL CONTINUE UNTIL MANUALLY STOPPED
