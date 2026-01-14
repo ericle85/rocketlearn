@@ -80,17 +80,19 @@ if __name__ == "__main__":
     device = "cuda"
 
     critic = Sequential(
-        Linear(state_dim, 256),
+        Linear(state_dim, 256),  # Layer 1
         ReLU(),
-        Linear(256, 256),
+        Linear(256, 256),        # Layer 2
         ReLU(),
-        Linear(256, 1)
+        Linear(256, 256),        # Layer 3
+        ReLU(),
+        Linear(256, 1)           # Output layer
     )
 
     actor =  DiscreteFF(state_dim,n_actions,[256, 256, 256], device)
 
     # CREATE THE OPTIMIZER
-    optim = torch.optim.Adam([
+    optim = torch.optim.AdamW([
         {"params": actor.parameters(), "lr": 1e-4},
         {"params": critic.parameters(), "lr": 1e-4}
     ])
@@ -103,11 +105,11 @@ if __name__ == "__main__":
         rollout_gen,
         agent,
         ent_coef=0.01,
-        n_steps=1_000_000,
-        batch_size=20_000,
-        minibatch_size=10_000,
-        epochs=10,
-        gamma=599 / 600,
+        n_steps=50_000,
+        batch_size=50_000,
+        minibatch_size=50_000,
+        epochs=2,
+        gamma=0.99,
         clip_range=0.2,
         gae_lambda=0.95,
         vf_coef=1,

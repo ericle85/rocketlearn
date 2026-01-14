@@ -5,7 +5,7 @@ from rocket_learn.agent.policy import Policy
 
 
 class ActorCriticAgent(nn.Module):
-    def __init__(self, actor: Policy, critic: nn.Module, optimizer: th.optim.Optimizer):
+    def __init__(self, actor: Policy, critic: nn.Module, optimizer: th.optim.Optimizer = None):
         super().__init__()
         self.actor = actor
         self.critic = critic

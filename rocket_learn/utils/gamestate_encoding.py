@@ -40,7 +40,7 @@ class StateConstants:
     DUMMY = 0
     BLUE_SCORE = 1
     ORANGE_SCORE = 2
-    BOOST_PADS = slice(3, 3 + GameState.BOOST_PADS_LENGTH)
+    BOOST_PADS = slice(3, 3 + len(GameState.boost_pad_timers))
     BALL_POSITION = slice(BOOST_PADS.stop, BOOST_PADS.stop + 3)
     BALL_LINEAR_VELOCITY = slice(BALL_POSITION.stop, BALL_POSITION.stop + 3)
     BALL_ANGULAR_VELOCITY = slice(BALL_LINEAR_VELOCITY.stop, BALL_LINEAR_VELOCITY.stop + 3)

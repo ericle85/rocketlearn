@@ -53,3 +53,23 @@ class VBGReward(RewardFunction[AgentID, GameState, float]):
         norm_pos_diff = pos_diff / np.linalg.norm(pos_diff)
         norm_vel = vel / BALL_MAX_SPEED
         return float(np.dot(norm_pos_diff, norm_vel))
+    
+
+class StayOnGroundReward(RewardFunction[AgentID, GameState, float]):
+    """
+        Gives a reward for staying on the ground
+    """
+
+    def reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
+        pass
+
+    def get_rewards(self, agents: List[AgentID], state: GameState, is_terminated: Dict[AgentID, bool],
+                    is_truncated: Dict[AgentID, bool], shared_info: Dict[str, Any]) -> Dict[AgentID, float]: 
+        return {agent: self._get_reward(agent, state) for agent in agents}
+
+    def _get_reward(self, agent: AgentID, state: GameState) -> float:
+        car = state.cars[agent]
+        if car.on_ground:
+            return 1.0
+        else:
+            return -1.0

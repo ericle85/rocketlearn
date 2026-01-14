@@ -1,9 +1,5 @@
-import cProfile
-import io
 import os
-import pstats
 import time
-import sys
 from typing import Iterator, List, Tuple, Union
 
 import numba
@@ -72,6 +68,7 @@ class PPO:
         self.device = device
         self.zero_grads_with_none = zero_grads_with_none
         self.frozen_iterations = 0
+        self.warmup = None
         self._saved_lr = None
 
         self.starting_iteration = 0
@@ -182,6 +179,10 @@ class PPO:
                     assert self._saved_lr is not None
                     self.agent.optimizer.param_groups[0]["lr"] = self._saved_lr
                     self._saved_lr = None
+                elif self.warmup is not None:
+                    assert self._saved_lr is not None
+                    progress = self.warmup(self.frozen_iterations)
+                    self.agent.optimizer.param_groups[0]["lr"] = self._saved_lr * progress
 
                 self.frozen_iterations -= 1
 
@@ -215,8 +216,11 @@ class PPO:
 
     @staticmethod
     @numba.njit
-    def _calculate_advantages_numba(rewards, values, gamma, gae_lambda, terminated, truncated):
+    def _calculate_advantages_numba(rewards, values, gamma, gae_lambda, truncated):
         advantages = np.zeros_like(rewards)
+        # v_targets = np.zeros_like(rewards)
+        dones = np.zeros_like(rewards)
+        dones[-1] = 1. if not truncated else 0.
         episode_starts = np.zeros_like(rewards)
         episode_starts[0] = 1.
         last_values = values[-1]
@@ -224,9 +228,7 @@ class PPO:
         size = len(advantages)
         for step in range(size - 1, -1, -1):
             if step == size - 1:
-                # If terminated, don't bootstrap (next_non_terminal = 0)
-                # If truncated but not terminated, bootstrap (next_non_terminal = 1)
-                next_non_terminal = 1.0 - terminated[-1].item()
+                next_non_terminal = 1.0 - dones[-1].item()
                 next_values = last_values
             else:
                 next_non_terminal = 1.0 - episode_starts[step + 1].item()
@@ -235,7 +237,8 @@ class PPO:
             delta = v_target - values[step]
             last_gae_lam = delta + gamma * gae_lambda * next_non_terminal * last_gae_lam
             advantages[step] = last_gae_lam
-        return advantages
+            # v_targets[step] = v_target
+        return advantages  # , v_targets
 
     def calculate(self, buffers: Iterator[ExperienceBuffer], iteration):
         """
@@ -248,7 +251,9 @@ class PPO:
         # advantage_tensors = []
         returns_tensors = []
 
-        rewards_tensors = []
+        # rewards_tensors = []
+
+        dist_other_tensors = []
 
         ep_rewards = []
         ep_steps = []
@@ -267,16 +272,20 @@ class PPO:
                 else:
                     x = obs_tensor.to(self.device)
                 values = self.agent.critic(x).detach().cpu().numpy().flatten()  # No batching?
+                if self.kl_models_weights is not None:
+                    for k, (model, kl_coef, half_life) in enumerate(self.kl_models_weights):
+                        dist_other = model.get_action_distribution(x).logits.cpu()
+                        dist_other_tensors.append(dist_other)
 
             actions = np.stack(buffer.actions)
             log_probs = np.stack(buffer.log_probs)
-            rewards = np.stack(buffer.rewards)
-            terminations = np.stack(buffer.terminated)
+            rewards = np.stack(buffer.rewards).astype(np.float32)
+            dones = np.stack(buffer.terminated)
             truncations = np.stack(buffer.truncated)
 
             size = rewards.shape[0]
 
-            advantages = self._calculate_advantages_numba(rewards, values, self.gamma, self.gae_lambda, terminations, truncations)
+            advantages = self._calculate_advantages_numba(rewards, values, self.gamma, self.gae_lambda, truncations[-1] == True)
 
             returns = advantages + values
 
@@ -284,7 +293,7 @@ class PPO:
             act_tensors.append(th.from_numpy(actions))
             log_prob_tensors.append(th.from_numpy(log_probs))
             returns_tensors.append(th.from_numpy(returns))
-            rewards_tensors.append(th.from_numpy(rewards))
+            # rewards_tensors.append(th.from_numpy(rewards))
 
             ep_rewards.append(rewards.sum())
             ep_steps.append(size)
@@ -308,6 +317,16 @@ class PPO:
         # advantages_tensor = th.cat(advantage_tensors)
         returns_tensor = th.cat(returns_tensors).float()
 
+        if self.kl_models_weights is not None:
+            dist_other_tensor = th.cat(dist_other_tensors).float()
+
+        # Make sure everything is on CPU
+        assert all(t.device.type == "cpu" for t in (obs_tensor if isinstance(obs_tensor, tuple) else (obs_tensor,)))
+        if self.kl_models_weights is not None:
+            assert all(t.device.type == "cpu" for t in (act_tensor, log_prob_tensor, returns_tensor, dist_other_tensor))
+        else:
+            assert all(t.device.type == "cpu" for t in (act_tensor, log_prob_tensor, returns_tensor))
+
         tot_loss = 0
         tot_policy_loss = 0
         tot_entropy_loss = 0
@@ -321,126 +340,147 @@ class PPO:
 
         n = 0
 
-        if self.jit_tracer is None:
-            self.jit_tracer = obs_tensor[0].to(self.device)
-
         print("Training network...")
 
         if self.frozen_iterations > 0:
             print("Policy network frozen, only updating value network...")
 
+        torch.cuda.empty_cache()
+
+        samples_from_latest = 0
         precompute = torch.cat([param.view(-1) for param in self.agent.actor.parameters()])
         t0 = time.perf_counter_ns()
         self.agent.optimizer.zero_grad(set_to_none=self.zero_grads_with_none)
         for e in range(self.epochs):
-            # this is mostly pulled from sb3
-            indices = torch.randperm(returns_tensor.shape[0])[:self.batch_size]
-            if isinstance(obs_tensor, tuple):
-                obs_batch = tuple(o[indices] for o in obs_tensor)
-            else:
-                obs_batch = obs_tensor[indices]
-            act_batch = act_tensor[indices]
-            log_prob_batch = log_prob_tensor[indices]
-            # advantages_batch = advantages_tensor[indices]
-            returns_batch = returns_tensor[indices]
+            all_indices = torch.randperm(returns_tensor.shape[0])
 
-            for i in range(0, self.batch_size, self.minibatch_size):
-                # Note: Will cut off final few samples
-
+            for b in range(0, self.n_steps, self.batch_size):
+                indices = all_indices[b: b + self.batch_size]
                 if isinstance(obs_tensor, tuple):
-                    obs = tuple(o[i: i + self.minibatch_size].to(self.device) for o in obs_batch)
+                    obs_batch = tuple(o[indices] for o in obs_tensor)
                 else:
-                    obs = obs_batch[i: i + self.minibatch_size].to(self.device)
-
-                act = act_batch[i: i + self.minibatch_size].to(self.device)
-                # adv = advantages_batch[i:i + self.minibatch_size].to(self.device)
-                ret = returns_batch[i: i + self.minibatch_size].to(self.device)
-
-                old_log_prob = log_prob_batch[i: i + self.minibatch_size].to(self.device)
-
-                # TODO optimization: use forward_actor_critic instead of separate in case shared, also use GPU
-                try:
-                    log_prob, entropy, dist = self.evaluate_actions(obs, act)  # Assuming obs and actions as input
-                except ValueError as e:
-                    print("ValueError in evaluate_actions", e)
-                    continue
-
-                ratio = torch.exp(log_prob - old_log_prob)
-
-                values_pred = self.agent.critic(obs)
-
-                values_pred = th.squeeze(values_pred)
-                adv = ret - values_pred.detach()
-                adv = (adv - th.mean(adv)) / (th.std(adv) + 1e-8)
-
-                # clipped surrogate loss
-                policy_loss_1 = adv * ratio
-                policy_loss_2 = adv * th.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range)
-                policy_loss = -torch.min(policy_loss_1, policy_loss_2).mean()
-
-                # **If we want value clipping, add it here**
-                value_loss = F.mse_loss(ret, values_pred)
-
-                if entropy is None:
-                    # Approximate entropy when no analytical form
-                    entropy_loss = -th.mean(-log_prob)
-                else:
-                    entropy_loss = entropy
-
-                kl_loss = 0
+                    obs_batch = obs_tensor[indices]
+                act_batch = act_tensor[indices]
+                log_prob_batch = log_prob_tensor[indices]
+                # advantages_batch = advantages_tensor[indices]
+                returns_batch = returns_tensor[indices]
                 if self.kl_models_weights is not None:
-                    for k, (model, kl_coef, half_life) in enumerate(self.kl_models_weights):
-                        if half_life is not None:
-                            kl_coef *= 0.5 ** (self.total_steps / half_life)
-                        with torch.no_grad():
-                            dist_other = model.get_action_distribution(obs)
-                        div = kl_divergence(dist_other, dist).mean()
-                        tot_kl_other_models[k] += div
-                        tot_kl_coeffs[k] = kl_coef
-                        kl_loss += kl_coef * div
+                    dist_other_batch = dist_other_tensor[indices]
 
-                loss = ((policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss + kl_loss)
-                        / (self.batch_size / self.minibatch_size))
+                for i in range(0, self.batch_size, self.minibatch_size):
+                    # Note: Will cut off final few samples
+                    j = i + self.minibatch_size
 
-                if not torch.isfinite(loss).all():
-                    print("Non-finite loss, skipping", n)
-                    print("\tPolicy loss:", policy_loss)
-                    print("\tEntropy loss:", entropy_loss)
-                    print("\tValue loss:", value_loss)
-                    print("\tTotal loss:", loss)
-                    print("\tRatio:", ratio)
-                    print("\tAdv:", adv)
-                    print("\tLog prob:", log_prob)
-                    print("\tOld log prob:", old_log_prob)
-                    print("\tEntropy:", entropy)
-                    print("\tActor has inf:", any(not p.isfinite().all() for p in self.agent.actor.parameters()))
-                    print("\tCritic has inf:", any(not p.isfinite().all() for p in self.agent.critic.parameters()))
-                    print("\tReward as inf:", not np.isfinite(ep_rewards).all())
-                    if isinstance(obs, tuple):
-                        for j in range(len(obs)):
-                            print(f"\tObs[{j}] has inf:", not obs[j].isfinite().all())
+                    if isinstance(obs_tensor, tuple):
+                        obs = tuple(o[i: j].to(self.device) for o in obs_batch)
                     else:
-                        print("\tObs has inf:", not obs.isfinite().all())
-                    continue
+                        obs = obs_batch[i: j].to(self.device)
 
-                loss.backward()
+                    act = act_batch[i: j].to(self.device)
+                    # adv = advantages_batch[i:i + self.minibatch_size].to(self.device)
+                    ret = returns_batch[i: j].to(self.device)
 
-                # Unbiased low variance KL div estimator from http://joschu.net/blog/kl-approx.html
-                total_kl_div += th.mean((ratio - 1) - (log_prob - old_log_prob)).item()
-                tot_loss += loss.item()
-                tot_policy_loss += policy_loss.item()
-                tot_entropy_loss += entropy_loss.item()
-                tot_value_loss += value_loss.item()
-                tot_clipped += th.mean((th.abs(ratio - 1) > self.clip_range).float()).item()
-                n += 1
-                # pb.update(self.minibatch_size)
+                    old_log_prob = log_prob_batch[i: j].to(self.device)
 
-            # Clip grad norm
-            if self.max_grad_norm is not None:
-                clip_grad_norm_(self.agent.actor.parameters(), self.max_grad_norm)
+                    # TODO optimization: use forward_actor_critic instead of separate in case shared, also use GPU
+                    try:
+                        log_prob, entropy, dist = self.evaluate_actions(obs, act)  # Assuming obs and actions as input
+                    except ValueError as err:
+                        print("ValueError in evaluate_actions", err)
+                        continue
 
-            self.agent.optimizer.step()
-            self.agent.optimizer.zero_grad(set_to_none=self.zero_grads_with_none)
+                    except RuntimeError as err:
+                        breakpoint()
+                        continue
+
+                    ratio = torch.exp(log_prob - old_log_prob)
+
+                    if n == 0:
+                        samples_from_latest += ((ratio - 1).abs() < 1e-8).sum()
+
+                    values_pred = self.agent.critic(obs)
+
+                    values_pred = th.squeeze(values_pred)
+                    adv = ret - values_pred.detach()
+                    adv = (adv - th.mean(adv)) / (th.std(adv) + 1e-8)
+
+                    clip_hi = 1 + self.clip_range
+                    clip_lo = 1 / clip_hi
+
+                    # clipped surrogate loss
+                    policy_loss_1 = adv * ratio
+                    policy_loss_2 = adv * th.clamp(ratio, clip_lo, clip_hi)
+                    policy_loss = -torch.min(policy_loss_1, policy_loss_2).mean()
+
+                    # **If we want value clipping, add it here**
+                    value_loss = F.mse_loss(ret, values_pred)
+
+                    if entropy is None:
+                        # Approximate entropy when no analytical form
+                        entropy_loss = -th.mean(-log_prob)
+                    else:
+                        entropy_loss = entropy
+
+                    kl_loss = 0
+                    if self.kl_models_weights is not None:
+                        for k, (model, kl_coef, half_life) in enumerate(self.kl_models_weights):
+                            if half_life is not None:
+                                kl_coef *= 0.5 ** (self.total_steps / half_life)
+                            dist_other = th.distributions.Categorical(
+                                logits=dist_other_batch[i: j].to(self.device))
+                            divs = kl_divergence(dist_other, dist)
+                            div = divs.mean()
+                            tot_kl_other_models[k] += div
+                            tot_kl_coeffs[k] = kl_coef
+                            kl_loss += kl_coef * div
+
+                    loss = ((policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss + kl_loss)
+                            / (self.batch_size / self.minibatch_size))
+
+                    if not torch.isfinite(loss).all():
+                        print("Non-finite loss, skipping", n)
+                        print("\tPolicy loss:", policy_loss)
+                        print("\tEntropy loss:", entropy_loss)
+                        print("\tValue loss:", value_loss)
+                        print("\tKL loss:", kl_loss)
+                        print("\tTotal loss:", loss)
+                        print("\tRatio:", ratio)
+                        print("\tAdv:", adv)
+                        print("\tLog prob:", log_prob)
+                        print("\tOld log prob:", old_log_prob)
+                        print("\tEntropy:", entropy)
+                        print("\tActor has inf:", any(not p.isfinite().all() for p in self.agent.actor.parameters()))
+                        print("\tCritic has inf:", any(not p.isfinite().all() for p in self.agent.critic.parameters()))
+                        print("\tReward as inf:", not np.isfinite(ep_rewards).all())
+                        if isinstance(obs, tuple):
+                            for j in range(len(obs)):
+                                print(f"\tObs[{j}] has inf:", not obs[j].isfinite().all())
+                        else:
+                            print("\tObs has inf:", not obs.isfinite().all())
+                        breakpoint()
+                        continue
+
+                    loss.backward()
+
+                    # Unbiased low variance KL div estimator from http://joschu.net/blog/kl-approx.html
+                    total_kl_div += th.mean((ratio - 1) - (log_prob - old_log_prob)).item()
+                    tot_loss += loss.item()
+                    tot_policy_loss += policy_loss.item()
+                    tot_entropy_loss += entropy_loss.item()
+                    tot_value_loss += value_loss.item()
+                    tot_clipped += th.mean(((ratio < clip_lo) | (ratio > clip_hi)).float()).item()
+                    print(tot_clipped)
+                    n += 1
+                    # pb.update(self.minibatch_size)
+
+                # Clip grad norm
+                if self.max_grad_norm is not None:
+                    clip_grad_norm_(self.agent.actor.parameters(), self.max_grad_norm)
+
+                self.agent.optimizer.step()
+                self.agent.optimizer.zero_grad(set_to_none=self.zero_grads_with_none)
+
+            torch.cuda.empty_cache()
 
         t1 = time.perf_counter_ns()
 
@@ -449,7 +489,7 @@ class PPO:
         postcompute = torch.cat([param.view(-1) for param in self.agent.actor.parameters()])
 
         log_dict = {
-            "ppo/loss": tot_loss / n,
+            "ppo/loss": tot_loss / n,  # TODO adjust for minibatch size changes
             "ppo/policy_loss": tot_policy_loss / n,
             "ppo/entropy_loss": tot_entropy_loss / n,
             "ppo/value_loss": tot_value_loss / n,
@@ -457,6 +497,7 @@ class PPO:
             "ppo/clip_fraction": tot_clipped / n,
             "ppo/epoch_time": (t1 - t0) / (1e6 * self.epochs),
             "ppo/update_magnitude": th.dist(precompute, postcompute, p=2),
+            "ppo/latest_model_ratio": samples_from_latest / self.minibatch_size,
         }
 
         if self.kl_models_weights is not None and len(self.kl_models_weights) > 0:
@@ -467,7 +508,7 @@ class PPO:
 
         self.logger.log(log_dict, step=iteration, commit=False)  # Is committed after when calculating fps
 
-    def load(self, load_location, continue_iterations=True):
+    def load(self, load_location, continue_iterations=True, load_critic=True):
         """
         load the model weights, optimizer values, and metadata
         :param load_location: checkpoint folder to read
@@ -476,8 +517,20 @@ class PPO:
 
         checkpoint = torch.load(load_location)
         self.agent.actor.load_state_dict(checkpoint['actor_state_dict'])
-        self.agent.critic.load_state_dict(checkpoint['critic_state_dict'])
-        self.agent.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if load_critic:
+            self.agent.critic.load_state_dict(checkpoint['critic_state_dict'])
+            self.agent.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        else:
+            # Load only actor part of the state dict
+            optimizer_state_dict = checkpoint['optimizer_state_dict']
+            # Actor comes first, anything after is critic
+            remove_keys = [key for key in optimizer_state_dict["state"].keys()
+                           if key >= len(list(self.agent.actor.parameters()))]
+            state = optimizer_state_dict["state"]
+            for key in remove_keys:
+                del state[key]
+            optimizer_state_dict["param_groups"] = self.agent.optimizer.state_dict()["param_groups"]
+            self.agent.optimizer.load_state_dict(optimizer_state_dict)
 
         if continue_iterations:
             self.starting_iteration = checkpoint['epoch']
@@ -510,13 +563,14 @@ class PPO:
             traced_actor = th.jit.trace(self.agent.actor, self.jit_tracer)
             torch.jit.save(traced_actor, version_dir + "\\jit_policy.jit")
 
-    def freeze_policy(self, frozen_iterations=100):
+    def freeze_policy(self, frozen_iterations=100, warmup=None):
         """
         Freeze policy network to allow value network to settle. Useful with pretrained policy networks.
 
         Note that network weights will not be transmitted when frozen.
 
         :param frozen_iterations: how many iterations the policy update will remain unchanged
+        :param warmup: a function defining how the learning rate should change over the frozen iterations
         """
 
         print("-------------------------------------------------------------")
@@ -524,6 +578,7 @@ class PPO:
         print("-------------------------------------------------------------")
 
         self.frozen_iterations = frozen_iterations
+        self.warmup = warmup
 
         self._saved_lr = self.agent.optimizer.param_groups[0]["lr"]
         self.agent.optimizer.param_groups[0]["lr"] = 0

@@ -34,7 +34,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=4,
+        default=12,
         help="Number of worker processes to launch (default: 16)"
     )
 

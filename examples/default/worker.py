@@ -17,7 +17,10 @@ from rocket_learn.rollout_generator.redis.redis_rollout_worker import RedisRollo
 from rlgym_tools.rocket_league.reward_functions.velocity_player_to_ball_reward import VelocityPlayerToBallReward
 from rlgym_tools.rocket_league.state_mutators.random_physics_mutator import RandomPhysicsMutator
 
+from rewards.kickoff_reward import KickoffReward
 from rewards.common_rewards import FaceBallReward
+from rewards.common_rewards import StayOnGroundReward
+from rewards.touch_condition import BallTouchedCondition
 if __name__ == "__main__":
     """
 
@@ -38,17 +41,16 @@ if __name__ == "__main__":
     team_size = 1
     action_repeat = 8
     no_touch_timeout_seconds = 10
-    game_timeout_seconds = 300
+    game_timeout_seconds = 10
     action_parser = RepeatAction(LookupTableAction(), repeats=action_repeat)
     termination_condition = GoalCondition()
-    truncation_condition = AnyCondition(NoTouchTimeoutCondition(timeout_seconds=no_touch_timeout_seconds),
-                                        TimeoutCondition(timeout_seconds=game_timeout_seconds))
+    truncation_condition = AnyCondition(NoTouchTimeoutCondition(timeout_seconds=no_touch_timeout_seconds), BallTouchedCondition())
 
-    reward_fn = CombinedReward((FaceBallReward(), 1), (TouchReward(), 50), (VelocityPlayerToBallReward(include_negative_values=False), 5))
+    reward_fn = KickoffReward()
 
     obs_builder = DefaultObs()
 
-    state_mutator = MutatorSequence(RandomPhysicsMutator()) # DO NOT INCLUDE TEAMSIZE MUTATOR YET
+    state_mutator = MutatorSequence(KickoffMutator()) # DO NOT INCLUDE TEAMSIZE MUTATOR YET
     
     # BUILD THE ROCKET LEAGUE MATCH THAT WILL BE USED FOR TRAINING
     # -ENSURE OBSERVATION, REWARD, AND ACTION CHOICES ARE THE SAME IN THE WORKER
@@ -78,4 +80,4 @@ if __name__ == "__main__":
                        send_obs=True,
                        streamer_mode=False,
                        send_gamestates=False,
-                       local_cache_name="example_model_database").run()
+                       local_cache_name=None).run()
