@@ -38,9 +38,7 @@ class RedisRolloutWorker:
      :param send_obs: Should observations be send back (increases data sent) - must send obs or gamestates
      :param scoreboard: Scoreboard object
      :param pretrained_agents: Dict{} of pretrained agents and their appearance probability
-     :param human_agent: human agent object. Sets a human match if not None
      :param force_paging: Should paging be forced
-     :param auto_minimize: automatically minimize the launched rocket league instance
      :param local_cache_name: name of local database used for model caching. If None, caching is not used
      :param gamemode_weights: dict of dynamic gamemode choice weights. If None, default equal experience
     """
@@ -49,7 +47,6 @@ class RedisRolloutWorker:
                  past_version_prob=.2, evaluation_prob=0.01, sigma_target=1,
                  dynamic_gm=True, team_size = 0 ,streamer_mode=False, send_gamestates=True, # This will be irrelevant
                  send_obs=True, scoreboard=None, pretrained_agents=None,
-                 human_agent=None,
                  local_cache_name=None, gamemode_weights=None, full_team_evaluations=False,
                  live_progress=True):
         # TODO model or config+params so workers can recreate just from redis connection?
@@ -66,11 +63,6 @@ class RedisRolloutWorker:
             self.pretrained_agents = pretrained_agents
             self.pretrained_total_prob = sum([self.pretrained_agents[key] for key in self.pretrained_agents])
 
-        self.human_agent = human_agent
-
-        if human_agent and pretrained_agents:
-            print("** WARNING - Human Player and Pretrained Agents are in conflict. **")
-            print("**           Pretrained Agents will be ignored.                  **")
 
         self.streamer_mode = streamer_mode
 
@@ -147,7 +139,7 @@ class RedisRolloutWorker:
                     return [-1] * n_old, [latest_rating] * n_old
             else:
                 probs /= s
-            versions = [np.random.choice(len(keys), p=probs)]
+            versions = [keys[np.random.choice(len(keys), p=probs)]]
             if self.full_team_evaluations:
                 versions = versions * per_team
             target_rating = values[versions[0]]
@@ -349,7 +341,7 @@ class RedisRolloutWorker:
 
             table_str = self.make_table(versions, ratings, blue, orange, pretrained_choice)
 
-            if evaluate and not self.streamer_mode and self.human_agent is None:
+            if evaluate and not self.streamer_mode:
                 print("EVALUATION GAME\n" + table_str)
                 result = rocket_learn.utils.generate_episode.generate_episode(self.env, agents, evaluate=True,
                                                                               scoreboard=self.scoreboard,
@@ -400,7 +392,8 @@ class RedisRolloutWorker:
             if not self.streamer_mode:
                 rollout_data = encode_buffers(rollouts,
                                               return_obs=self.send_obs,
-                                              return_rewards=True)
+                                              return_rewards=True,
+                                              return_states=self.send_gamestates)
 
                 rollout_bytes = _serialize((rollout_data, versions, self.uuid, self.name, result,
                                             self.send_obs, self.send_gamestates, True))

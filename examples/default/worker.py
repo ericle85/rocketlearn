@@ -62,7 +62,7 @@ if __name__ == "__main__":
         termination_cond=termination_condition,
         truncation_cond=truncation_condition,
         transition_engine=RocketSimEngine(),
-        renderer=RocketSimVisRenderer(),
+        renderer=RocketSimVisRenderer(udp_ip="100.90.35.22"),
     )
 
     # LINK TO THE REDIS SERVER YOU SHOULD HAVE RUNNING (USE THE SAME PASSWORD YOU SET IN THE REDIS

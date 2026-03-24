@@ -78,8 +78,14 @@ def get_rating(gamemode: str, model_id: Optional[str], redis: Redis) -> Union[Ra
     return Rating(*_unserialize(redis.hget(quality_key, model_id)))
 
 
-def encode_buffers(buffers: List[ExperienceBuffer], return_obs=True, return_rewards=True):
+def encode_buffers(buffers: List[ExperienceBuffer], return_obs=True, return_rewards=True, return_states=False):
+    from rocket_learn.utils.gamestate_encoding import encode_gamestate
     res = []
+
+    if return_states:
+        states = [[encode_gamestate(info["state"], info.get("blue_score", 0), info.get("orange_score", 0)) for info in buffer.infos if "state" in info]
+                  for buffer in buffers]
+        res.append(states)
 
     if return_obs:
         observations = [buffer.observations for buffer in buffers]

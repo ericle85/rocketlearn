@@ -1,124 +1,56 @@
+"""
+Barebones learner: builds a fresh model and uploads it to Redis so workers can start collecting.
+Run this once before starting workers, then replace with your real training loop.
+"""
+
 import os
-import wandb
-import numpy as np
-from typing import Any
-from typing import List, Dict, Any, Tuple
-
-import torch.jit
-from torch.nn import Linear, Sequential, ReLU
-
+import torch
 from redis import Redis
 
-from rlgym.rocket_league.obs_builders.default_obs import DefaultObs
-from rlgym.api import ObsBuilder, AgentID
-from rlgym.rocket_league.api import Car, GameState
-from rlgym.rocket_league.reward_functions import TouchReward
-from rlgym.rocket_league.action_parsers import LookupTableAction
-
-from rocket_learn.agent.actor_critic_agent import ActorCriticAgent
 from rocket_learn.agent.discrete_ff import DiscreteFF
-from rocket_learn.ppo import PPO
-from rocket_learn.rollout_generator.redis.redis_rollout_generator import RedisRolloutGenerator
-from rocket_learn.utils.util import SplitLayer
+from trueskill import Rating
+from rocket_learn.rollout_generator.redis.utils import (
+    _serialize_model, _serialize, MODEL_LATEST, VERSION_LATEST, N_UPDATES,
+    LATEST_RATING_ID, QUALITIES, OPPONENT_MODELS
+)
 
+# --- Config (must match worker.py) ---
+REDIS_HOST = "127.0.0.1"
+REDIS_PORT = 6379
+REDIS_PASSWORD = os.environ["REDIS_PASSWORD"]
 
-# ROCKET-LEARN ALWAYS EXPECTS A BATCH DIMENSION IN THE BUILT OBSERVATION
-class ExpandDefaultOBS(DefaultObs):
-    def build_obs(self, agents: List[AgentID], state: GameState, shared_info: Dict[str, Any]) -> Dict[
-        AgentID, np.ndarray]:
-        self._state = state
-        obs = {}
-        for agent in agents:
-            obs[agent] = np.expand_dims(self._build_obs(agent, state, shared_info), 0)
-        return obs
-
+OBS_SIZE = 172        # match your obs builder output size
+N_ACTIONS = 90        # LookupTableAction default
+LAYER_SIZES = (256, 256, 256)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+TEAM_SIZE = 1         # must match worker.py team_size
+# -------------------------------------
 
 if __name__ == "__main__":
-    """
-    
-    Starts up a rocket-learn learner process, which ingests incoming data, updates parameters
-    based on results, and sends updated model parameters out to the workers
-    
-    """
+    redis = Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD)
+    redis.flushdb()  # WARNING: THIS CLEARS EVERYTHING IN THE REDIS DATABASE! BE CAREFUL!
 
-    # ROCKET-LEARN USES WANDB WHICH REQUIRES A LOGIN TO USE. YOU CAN SET AN ENVIRONMENTAL VARIABLE
-    # OR HARDCODE IT IF YOU ARE NOT SHARING YOUR SOURCE FILES
-    wandb.login(key=os.environ["WANDB_API_KEY"])
-    logger = wandb.init(project="demo", entity="leeric85")
-    logger.name = "DEFAULT_LEARNER_EXAMPLE"
-
-    # LINK TO THE REDIS SERVER YOU SHOULD HAVE RUNNING (USE THE SAME PASSWORD YOU SET IN THE REDIS
-    # CONFIG)
-    redis = Redis(password=os.environ["REDIS_PASSWORD"])
-
-    # ** ENSURE OBSERVATION, REWARD, AND ACTION CHOICES ARE THE SAME IN THE WORKER **
-    # NOT BEING USED CURRENTLY
-    def obs():
-        return DefaultObs()
-
-    def rew():
-        return TouchReward()
-
-    def act():
-        return LookupTableAction()
-
-
-    # THE ROLLOUT GENERATOR CAPTURES INCOMING DATA THROUGH REDIS AND PASSES IT TO THE LEARNER.
-    # -save_every SPECIFIES HOW OFTEN REDIS DATABASE IS BACKED UP TO DISK
-    # -model_every SPECIFIES HOW OFTEN OLD VERSIONS ARE SAVED TO REDIS. THESE ARE USED FOR TRUESKILL
-    # COMPARISON AND TRAINING AGAINST PREVIOUS VERSIONS
-    # -clear DELETE REDIS ENTRIES WHEN STARTING UP (SET TO FALSE TO CONTINUE WITH OLD AGENTS)
-    rollout_gen = RedisRolloutGenerator("demo-bot", redis, obs, rew, act,
-                                        logger=logger,
-                                        save_every=100,
-                                        model_every=100,
-                                        clear=True)
-
-    # TOTAL SIZE OF THE INPUT DATA
-    state_dim = 172
-    n_actions = 90
-    device = "cuda"
-
-    critic = Sequential(
-        Linear(state_dim, 256),  # Layer 1
-        ReLU(),
-        Linear(256, 256),        # Layer 2
-        ReLU(),
-        Linear(256, 256),        # Layer 3
-        ReLU(),
-        Linear(256, 1)           # Output layer
+    model = DiscreteFF(
+        input_shape=OBS_SIZE,
+        n_actions=N_ACTIONS,
+        layer_sizes=LAYER_SIZES,
+        device=DEVICE,
     )
 
-    actor =  DiscreteFF(state_dim,n_actions,[256, 256, 256], device)
+    model_bytes = _serialize_model(model)
+    redis.set(MODEL_LATEST, model_bytes)
+    redis.set(VERSION_LATEST, 0)
+    redis.set(N_UPDATES, 0)
 
-    # CREATE THE OPTIMIZER
-    optim = torch.optim.AdamW([
-        {"params": actor.parameters(), "lr": 1e-4},
-        {"params": critic.parameters(), "lr": 1e-4}
-    ])
+    # Initialize rating for version 0
+    gamemode = f"{TEAM_SIZE}v{TEAM_SIZE}"
+    quality_key = QUALITIES.format(gamemode)
+    rating_id = "0"
+    redis.set(LATEST_RATING_ID, rating_id)
+    default_rating = Rating()
+    redis.hset(quality_key, f"{rating_id}-stochastic", _serialize([default_rating.mu, default_rating.sigma]))
+    redis.hset(OPPONENT_MODELS, rating_id, model_bytes)
 
-    # PPO REQUIRES AN ACTOR/CRITIC AGENT
-    agent = ActorCriticAgent(actor=actor, critic=critic, optimizer=optim)
-
-    # INSTANTIATE THE PPO TRAINING ALGORITHM
-    alg = PPO(
-        rollout_gen,
-        agent,
-        ent_coef=0.01,
-        n_steps=50_000,
-        batch_size=50_000,
-        minibatch_size=50_000,
-        epochs=2,
-        gamma=0.99,
-        clip_range=0.2,
-        gae_lambda=0.95,
-        vf_coef=1,
-        max_grad_norm=0.5,
-        logger=logger,
-        device=device,
-    )
-
-    # BEGIN TRAINING. IT WILL CONTINUE UNTIL MANUALLY STOPPED
-    # -iterations_per_save SPECIFIES HOW OFTEN CHECKPOINTS ARE SAVED
-    # -save_dir SPECIFIES WHERE
-    alg.run(iterations_per_save=100, save_dir="checkpoint_save_directory")
+    print(f"Uploaded fresh model to Redis ({len(model_bytes) / 1024:.1f} KB)")
+    print(f"Device: {DEVICE} | obs_size={OBS_SIZE} | n_actions={N_ACTIONS} | layers={LAYER_SIZES}")
+    print("Workers can now start.")
