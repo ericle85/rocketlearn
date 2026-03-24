@@ -251,7 +251,6 @@ def generate_episode(
         _restore_env(env, saved_eval)
         return result
 
-    print(f"Rollout lenth: {rollouts[0].size()} steps")
     if pbar is not None:
         pbar.close()
 

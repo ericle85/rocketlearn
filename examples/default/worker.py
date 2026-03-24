@@ -75,9 +75,9 @@ if __name__ == "__main__":
                        past_version_prob=.2,
                        evaluation_prob=0.01,
                        sigma_target=2,
-                       dynamic_gm=False,
+                       dynamic_gm=True,
                        team_size=team_size,
                        send_obs=True,
-                       streamer_mode=False,
+                       render=False,
                        send_gamestates=False,
                        local_cache_name=None).run()

@@ -1,451 +1,580 @@
-import functools
+"""
+Redis rollout worker — functional style.
+
+Structure:
+  Pure functions  — no I/O, no side effects, deterministic given inputs
+  I/O functions   — clearly labelled, kept at the edges
+  run()           — thin loop that wires pure + I/O together
+  RedisRolloutWorker — config dataclass + entry point
+"""
+
 import itertools
-import os
 import time
-from threading import Thread
+from dataclasses import dataclass, field
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
-import sqlite3 as sql
-
 import numpy as np
+import sqlite3 as sql
 from redis import Redis
 from rlgym.api import RLGym
 from tabulate import tabulate
 
 import rocket_learn.utils.generate_episode
+from rocket_learn.agent.pretrained_policy import HardcodedAgent
+from rocket_learn.rollout_generator.redis.utils import (
+    EXPERIENCE_PER_MODE, LATEST_RATING_ID, MODEL_LATEST, OPPONENT_MODELS,
+    QUALITIES, ROLLOUTS, VERSION_LATEST, WORKER_IDS,
+    _serialize, _unserialize_model, encode_buffers, get_rating,
+)
 from rocket_learn.utils.env_wrapper import RLGymV2GymWrapper
+from rocket_learn.utils.util import probability_NvsM
 from rlgym.rocket_league.state_mutators import MutatorSequence
 from rlgym_tools.rocket_league.state_mutators.variable_team_size_mutator import VariableTeamSizeMutator
-from rocket_learn.rollout_generator.redis.utils import _unserialize_model, MODEL_LATEST, WORKER_IDS, OPPONENT_MODELS, \
-    VERSION_LATEST, _serialize, ROLLOUTS, encode_buffers, get_rating, LATEST_RATING_ID, \
-    EXPERIENCE_PER_MODE
-from rocket_learn.utils.util import probability_NvsM
 
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class WorkerConfig:
+    name:                 str
+    device:               str
+    past_version_prob:    float = 0.2
+    evaluation_prob:      float = 0.01
+    sigma_target:         float = 1.0
+    dynamic_gm:           bool  = False
+    team_size:            int   = 1
+    render:               bool  = False
+    send_gamestates:      bool  = True
+    send_obs:             bool  = True
+    full_team_evaluations:bool  = False
+    live_progress:        bool  = True
+    local_cache_name:     Optional[str] = None
+    pretrained_agents:    Dict[Any, float] = field(default_factory=dict)
+    scoreboard:           Any   = None
+
+
+# ---------------------------------------------------------------------------
+# Pure functions
+# ---------------------------------------------------------------------------
+
+def select_gamemode(mode_exp: Dict[str, int]) -> Tuple[int, int]:
+    """Pick the gamemode with least experience. Ties broken uniformly."""
+    min_exp = min(mode_exp.values())
+    least   = [m for m, v in mode_exp.items() if v == min_exp]
+    mode    = np.random.choice(least)
+    b, o    = mode.split("v")
+    return int(b), int(o)
+
+
+def decide_n_old(
+    evaluate: bool,
+    n_agents: int,
+    past_version_prob: float,
+    pretrained_agents: Dict[Any, float],
+) -> Tuple[int, Optional[Any]]:
+    """
+    Returns (n_old, pretrained_choice).
+    Pure: takes a pre-drawn random float to stay testable.
+    """
+    if evaluate:
+        return n_agents, None
+
+    pretrained_total = sum(pretrained_agents.values())
+    rand = np.random.random()
+
+    if rand < past_version_prob:
+        return np.random.randint(1, n_agents), None
+
+    if rand < past_version_prob + pretrained_total:
+        cumulative = past_version_prob
+        for agent, prob in pretrained_agents.items():
+            cumulative += prob
+            if rand < cumulative:
+                return np.random.randint(1, n_agents), agent
+
+    return 0, None
+
+
+def pick_eval_version_probs(
+    sigmas: np.ndarray,
+    sigma_target: float,
+) -> Optional[np.ndarray]:
+    """
+    Returns probability array over versions for an eval game,
+    or None if all sigmas are below target (fall back to latest-only).
+    """
+    probs = np.clip(sigmas - sigma_target, a_min=0, a_max=None)
+    if probs.sum() == 0:
+        if np.random.normal(0, sigma_target) > 1:
+            return np.ones(len(sigmas)) / len(sigmas)
+        return None
+    return probs / probs.sum()
+
+
+def pick_old_version_probs(
+    values,
+    target_rating,
+    n_new: int,
+    n_old: int,
+    eval_version_idx: Optional[int],
+) -> np.ndarray:
+    """Win-probability weighting for selecting old opponents."""
+    probs = np.zeros(len(values))
+    for i, rating in enumerate(values):
+        if eval_version_idx is not None and i == eval_version_idx:
+            continue  # don't add more of the same agent in eval
+        p = probability_NvsM([rating], [target_rating])
+        probs[i] = (p * (1 - p)) ** ((n_new + n_old) // 2)
+    s = probs.sum()
+    return probs / s if s > 0 else probs
+
+
+def pick_fair_matchup(
+    versions: List,
+    values,
+    latest_rating,
+    n_new: int,
+) -> Tuple[List, List]:
+    """
+    From a list of chosen version indices, find the permutation with
+    the fairest team split (AlphaStar-style p*(1-p) weighting).
+    Returns (version_keys, ratings).
+    """
+    matchups, qualities = [], []
+    for perm in itertools.permutations(versions):
+        it_ratings = [latest_rating if v == -1 else values[v] for v in perm]
+        mid = len(it_ratings) // 2
+        p = probability_NvsM(it_ratings[:mid], it_ratings[mid:])
+        if n_new == 0 and set(perm[:mid]) == set(perm[mid:]):
+            p = 0
+        matchups.append(perm)
+        qualities.append(p * (1 - p))
+
+    qualities = np.array(qualities)
+    s = qualities.sum()
+    if s == 0:
+        return versions, [latest_rating] * len(versions)
+
+    k = np.random.choice(len(matchups), p=qualities / s)
+    chosen = matchups[k]
+    chosen_ratings = [latest_rating if v == -1 else values[v] for v in chosen]
+    return list(chosen), chosen_ratings
+
+
+def build_version_table(
+    versions: List,
+    ratings: List,
+    blue: int,
+    orange: int,
+    pretrained_choice: Optional[Any],
+) -> str:
+    """Pure: formats matchup as a display table string."""
+    def fmt(v, r):
+        if pretrained_choice is not None and v == "na":
+            return [type(pretrained_choice).__name__, "N/A"]
+        if v == "na":
+            return ["Human", "N/A"]
+        label = f"Latest ({-v})" if isinstance(v, int) and v < 0 else str(v)
+        return [label, f"{r.mu:.2f}±{2 * r.sigma:.2f}"]
+
+    info        = [fmt(v, r) for v, r in zip(versions, ratings)]
+    blue_info   = info[:blue]
+    orange_info = info[blue:]
+
+    pad = abs(blue - orange)
+    if blue < orange:
+        blue_info   += [["", ""]] * pad
+    elif orange < blue:
+        orange_info += [["", ""]] * pad
+
+    rows = [bv + ov for bv, ov in zip(blue_info, orange_info)]
+    return tabulate(rows, headers=["Blue", "rating", "Orange", "rating"],
+                    tablefmt="rounded_outline")
+
+
+def format_post_stats(
+    n_steps: int,
+    total_steps: int,
+    result: int,
+    goal_speed_kph: float,
+) -> str:
+    sign  = "+" if result > 0 else ""
+    stats = (f"Rollout finished after {n_steps} steps "
+             f"({total_steps} total steps), result was {sign}{result}")
+    if result != 0:
+        stats += f", goal speed: {goal_speed_kph:.2f} kph"
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# I/O functions
+# ---------------------------------------------------------------------------
+
+def io_fetch_latest_model(redis: Redis, device: str, current_version: Optional[int]):
+    """Returns (version, model) if a new version is available, else (current_version, None)."""
+    available = redis.get(VERSION_LATEST)
+    if available is None:
+        return current_version, None
+    available = int(available)
+    if available == current_version:
+        return current_version, None
+    model_bytes = redis.get(MODEL_LATEST)
+    if model_bytes is None:
+        return current_version, None
+    return available, _unserialize_model(model_bytes, device)
+
+
+def io_read_mode_experience(redis: Redis) -> Dict[str, int]:
+    return {m.decode(): int(v) for m, v in redis.hgetall(EXPERIENCE_PER_MODE).items()}
+
+
+def io_increment_mode_experience(redis: Redis, mode: str, exp: int) -> None:
+    redis.hincrby(EXPERIENCE_PER_MODE, mode, exp)
+
+
+def io_init_mode_experience(redis: Redis, team_size: int) -> None:
+    from trueskill import Rating as TrueSkillRating
+    latest_id = redis.get(LATEST_RATING_ID)
+    if latest_id is None:
+        raise RuntimeError("Learner has not initialized Redis yet (LATEST_RATING_ID missing). "
+                           "Start the learner before workers.")
+    latest_id = latest_id.decode()
+    for i in range(1, team_size + 1):
+        mode = f"{i}v{i}"
+        if not redis.hexists(EXPERIENCE_PER_MODE, mode):
+            redis.hset(EXPERIENCE_PER_MODE, mode, 0)
+        quality_key = QUALITIES.format(mode)
+        for suffix in ("stochastic", "deterministic"):
+            key = f"{latest_id}-{suffix}"
+            if not redis.hexists(quality_key, key):
+                default = TrueSkillRating()
+                redis.hset(quality_key, key, _serialize([default.mu, default.sigma]))
+
+
+def io_push_rollout(redis: Redis, rollout_bytes: bytes) -> None:
+    n_items = redis.rpush(ROLLOUTS, rollout_bytes)
+    if n_items >= 1000:
+        print("Had to limit rollouts. Learner may have crashed or is overloaded")
+        redis.ltrim(ROLLOUTS, -100, -1)
+
+
+def io_get_ratings(redis: Redis, gamemode: str, model_id: Optional[str]):
+    return get_rating(gamemode, model_id, redis)
+
+
+def io_build_past_model_loader(redis: Redis, device: str, local_cache_name: Optional[str]):
+    """
+    Returns a cached loader function: version_base_str -> model.
+    Encapsulates SQLite caching so callers stay pure.
+    """
+    db = None
+    if local_cache_name:
+        db = sql.connect(f"redis-model-cache-{local_cache_name}.db")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS MODELS (
+                id TEXT PRIMARY KEY,
+                parameters BLOB NOT NULL
+            )
+        """)
+
+    @lru_cache(maxsize=8)
+    def load(version: str):
+        if db is not None:
+            rows = db.execute(
+                "SELECT parameters FROM MODELS WHERE id = ?", (version,)
+            ).fetchall()
+            if rows:
+                return _unserialize_model(rows[0][0], device)
+            bytestream = redis.hget(OPPONENT_MODELS, version)
+            db.execute("INSERT INTO MODELS (id, parameters) VALUES (?, ?)",
+                       (version, bytestream))
+            db.commit()
+            return _unserialize_model(bytestream, device)
+        return _unserialize_model(redis.hget(OPPONENT_MODELS, version), device)
+
+    return load
+
+
+def io_build_env(rlgym_env: RLGym, team_size_mutator: VariableTeamSizeMutator,
+                 default_team_size: int) -> RLGymV2GymWrapper:
+    team_size_mutator.mode_weights = {(default_team_size, default_team_size): 1}
+    rlgym_env.state_mutator = MutatorSequence(team_size_mutator, rlgym_env.state_mutator)
+    return RLGymV2GymWrapper(rlgym_env)
+
+
+# ---------------------------------------------------------------------------
+# Matchup builder — thin I/O wrapper around pure logic
+# ---------------------------------------------------------------------------
+
+def build_matchup(
+    redis: Redis,
+    current_agent,
+    load_past_model,
+    n_agents: int,
+    latest_version: int,
+    evaluate: bool,
+    past_version_prob: float,
+    pretrained_agents: Dict,
+    sigma_target: float,
+    full_team_evaluations: bool,
+) -> Tuple[List, List, List, bool]:
+    """
+    Returns (agents, versions, ratings, is_evaluate).
+    Versions use latest_version int (not -1) for latest agent slots.
+    """
+    per_team = n_agents // 2
+    gamemode = f"{per_team}v{per_team}"
+
+    n_old, pretrained_choice = decide_n_old(
+        evaluate, n_agents, past_version_prob, pretrained_agents
+    )
+    n_new = n_agents - n_old
+
+    latest_id  = redis.get(LATEST_RATING_ID).decode()
+    latest_key = f"{latest_id}-stochastic"
+
+    # All-latest game
+    if n_old == 0:
+        rating  = io_get_ratings(redis, gamemode, latest_key)
+        ratings = [rating] * n_new
+        agents   = [current_agent] * n_new
+        has_latest = True
+        return agents, [latest_version] * n_new, ratings, not has_latest
+
+    all_ratings = io_get_ratings(redis, gamemode, None)
+    latest_rating = all_ratings[latest_key]
+    keys   = list(all_ratings.keys())
+    values = list(all_ratings.values())
+
+    is_eval = n_new == 0
+
+    if pretrained_choice is not None:
+        slot_versions = [-1] * n_new + ["na"] * n_old
+        np.random.shuffle(slot_versions)
+    elif is_eval:
+        sigmas = np.array([r.sigma for r in values])
+        probs  = pick_eval_version_probs(sigmas, sigma_target)
+        if probs is None:
+            # All sigmas below target — pick uniformly, still run eval
+            probs = np.ones(len(values)) / len(values)
+
+        chosen_idx = int(np.random.choice(len(keys), p=probs))
+        chosen_key = keys[chosen_idx]
+        if full_team_evaluations:
+            eval_slots = [chosen_key] * per_team
+        else:
+            eval_slots = [chosen_key]
+
+        # Fill remaining slots — duplicate chosen version if not enough others
+        n_extra = n_old - len(eval_slots)
+        if n_extra > 0:
+            extra_probs = pick_old_version_probs(values, values[chosen_idx],
+                                                 n_new, n_old, chosen_idx)
+            if extra_probs.sum() == 0:
+                extra_probs = np.ones(len(values)) / len(values)
+            extra_slots = np.random.choice(len(extra_probs), size=n_extra,
+                                           p=extra_probs, replace=True).tolist()
+            slot_versions = eval_slots + [keys[i] for i in extra_slots]
+        else:
+            slot_versions = eval_slots
+    else:
+        if n_new == 0:
+            n_new, n_old = n_old, 0
+        old_probs  = pick_old_version_probs(values, latest_rating, n_new, n_old, None)
+        old_chosen = np.random.choice(len(old_probs), size=n_old,
+                                      p=old_probs, replace=True).tolist()
+        slot_versions = [-1] * n_new + [keys[i] for i in old_chosen]
+
+    # Find fairest permutation
+    idx_versions = [
+        -1 if v == -1 else (keys.index(v) if v in keys else v)
+        for v in slot_versions
+    ]
+    fair_versions, fair_ratings = pick_fair_matchup(
+        idx_versions, values, latest_rating, n_new
+    )
+
+    # Resolve agents
+    agents = []
+    resolved_versions = []
+    for v in fair_versions:
+        if v == -1:
+            agents.append(current_agent)
+            resolved_versions.append(latest_version)
+        elif pretrained_choice is not None and v == "na":
+            agents.append(pretrained_choice)
+            resolved_versions.append("na")
+        else:
+            key    = keys[v] if isinstance(v, int) else v
+            base   = "-".join(key.split("-")[:-1])
+            model  = load_past_model(base)
+            model.deterministic = key.endswith("deterministic")
+            agents.append(model)
+            resolved_versions.append(key)
+
+    has_latest  = latest_version in resolved_versions
+    is_evaluate = not has_latest
+    return agents, resolved_versions, fair_ratings, is_evaluate
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def run(config: WorkerConfig, env: RLGym) -> None:
+    redis = config._redis  # injected by RedisRolloutWorker
+
+    load_past_model   = io_build_past_model_loader(redis, config.device, config.local_cache_name)
+    team_size_mutator = VariableTeamSizeMutator(mode_weights={})
+    wrapped_env       = io_build_env(env, team_size_mutator, config.team_size)
+
+    if config.dynamic_gm:
+        io_init_mode_experience(redis, config.team_size)
+
+    current_version: Optional[int] = None
+    current_agent                  = None
+    total_steps                    = 0
+
+    while True:
+        # --- fetch latest model if updated ---
+        current_version, new_agent = io_fetch_latest_model(
+            redis, config.device, current_version
+        )
+        if new_agent is not None:
+            current_agent = new_agent
+        if current_agent is None:
+            time.sleep(1)
+            continue
+
+        # --- pick gamemode ---
+        if config.dynamic_gm:
+            mode_exp     = io_read_mode_experience(redis)
+            blue, orange = select_gamemode(mode_exp)
+        else:
+            blue = orange = config.team_size
+
+        team_size_mutator.mode_weights = {(blue, orange): 1}
+
+        # --- build matchup ---
+        evaluate = np.random.random() < config.evaluation_prob
+        agents, versions, ratings, evaluate = build_matchup(
+            redis          = redis,
+            current_agent  = current_agent,
+            load_past_model= load_past_model,
+            n_agents       = blue + orange,
+            latest_version = current_version,
+            evaluate       = evaluate,
+            past_version_prob   = config.past_version_prob,
+            pretrained_agents   = config.pretrained_agents,
+            sigma_target        = config.sigma_target,
+            full_team_evaluations = config.full_team_evaluations,
+        )
+
+        pretrained_choice = next(
+            (a for a in agents if isinstance(a, HardcodedAgent)), None
+        )
+        table = build_version_table(versions, ratings, blue, orange, pretrained_choice)
+
+        # --- run episode ---
+        if evaluate:
+            print("EVALUATION GAME\n" + table)
+            result = rocket_learn.utils.generate_episode.generate_episode(
+                wrapped_env, agents,
+                evaluate=True,
+                scoreboard=config.scoreboard,
+                progress=config.live_progress,
+                render=config.render,
+            )
+            rollouts = []
+            print(f"Evaluation finished, goal differential: {result}\n")
+        else:
+            print("ROLLOUT\n" + table)
+            try:
+                rollouts, result = rocket_learn.utils.generate_episode.generate_episode(
+                    wrapped_env, agents,
+                    evaluate=False,
+                    scoreboard=config.scoreboard,
+                    progress=config.live_progress,
+                    render=config.render,
+                )
+            except EnvironmentError:
+                wrapped_env.attempt_recovery()
+                continue
+
+            if len(rollouts[0].observations) <= 1:
+                print(" ** Rollout Generation Error: Restarting **\n")
+                continue
+
+            n_steps     = len(rollouts[0].observations)
+            episode_exp = n_steps * len(rollouts)
+            total_steps += episode_exp
+
+            if config.dynamic_gm:
+                io_increment_mode_experience(redis, f"{blue}v{orange}", episode_exp)
+
+            goal_speed = (np.linalg.norm(rollouts[0].infos[-2]["state"].ball.linear_velocity)
+                          * 0.036)
+            print(format_post_stats(n_steps, total_steps, result, goal_speed) + "\n")
+
+        # --- send to learner ---
+        rollout_data  = encode_buffers(rollouts,
+                                       return_obs=config.send_obs,
+                                       return_rewards=True,
+                                       return_states=config.send_gamestates)
+        rollout_bytes = _serialize((rollout_data, versions, config._uuid,
+                                    config.name, result,
+                                    config.send_obs, config.send_gamestates, True))
+        io_push_rollout(redis, rollout_bytes)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 class RedisRolloutWorker:
-    """
-    Provides RedisRolloutGenerator with rollouts via a Redis server
+    def __init__(self, redis: Redis, name: str, env: RLGym, device: str,
+                 past_version_prob=0.2, evaluation_prob=0.01, sigma_target=1.0,
+                 dynamic_gm=False, team_size=1, render=False,
+                 send_gamestates=True, send_obs=True, scoreboard=None,
+                 pretrained_agents=None, local_cache_name=None,
+                 full_team_evaluations=False, live_progress=True):
 
-     :param redis: redis object
-     :param name: rollout worker name
-     :param match: match object
-     :param past_version_prob: Odds of playing against previous checkpoints
-     :param evaluation_prob: Odds of running an evaluation match
-     :param sigma_target: Trueskill sigma target
-     :param dynamic_gm: Pick game mode dynamically. If True, Match.team_size should be 3
-     :param streamer_mode: Should run in streamer mode (less data printed to screen)
-     :param send_gamestates: Should gamestate data be sent back (increases data sent) - must send obs or gamestates
-     :param send_obs: Should observations be send back (increases data sent) - must send obs or gamestates
-     :param scoreboard: Scoreboard object
-     :param pretrained_agents: Dict{} of pretrained agents and their appearance probability
-     :param force_paging: Should paging be forced
-     :param local_cache_name: name of local database used for model caching. If None, caching is not used
-     :param gamemode_weights: dict of dynamic gamemode choice weights. If None, default equal experience
-    """
+        assert send_gamestates or send_obs, "Must send at least one of obs or states"
+        assert team_size > 0, "team_size must be >= 1"
 
-    def __init__(self, redis: Redis, name: str, env: RLGym, device : str,
-                 past_version_prob=.2, evaluation_prob=0.01, sigma_target=1,
-                 dynamic_gm=True, team_size = 0 ,streamer_mode=False, send_gamestates=True, # This will be irrelevant
-                 send_obs=True, scoreboard=None, pretrained_agents=None,
-                 local_cache_name=None, gamemode_weights=None, full_team_evaluations=False,
-                 live_progress=True):
-        # TODO model or config+params so workers can recreate just from redis connection?
-        self.redis = redis
-        self.name = name
-        self.device = device
+        self._env   = env
+        self._redis = redis
+        self._uuid  = str(uuid4())
 
-        assert send_gamestates or send_obs, "Must have at least one of obs or states"
-        assert dynamic_gm or team_size > 0, "Team sizes must be at least 1 or have dynamic_gm set to true"
+        redis.rpush(WORKER_IDS, self._uuid)
+        print(f"Started worker {self._uuid} on host "
+              f"{redis.connection_pool.connection_kwargs.get('host')} "
+              f"under name {name}")
 
-        self.pretrained_agents = {}
-        self.pretrained_total_prob = 0
-        if pretrained_agents is not None:
-            self.pretrained_agents = pretrained_agents
-            self.pretrained_total_prob = sum([self.pretrained_agents[key] for key in self.pretrained_agents])
+        self._config = WorkerConfig(
+            name=name, device=device,
+            past_version_prob=past_version_prob,
+            evaluation_prob=evaluation_prob,
+            sigma_target=sigma_target,
+            dynamic_gm=dynamic_gm,
+            team_size=team_size,
+            render=render,
+            send_gamestates=send_gamestates,
+            send_obs=send_obs,
+            full_team_evaluations=full_team_evaluations,
+            live_progress=live_progress,
+            local_cache_name=local_cache_name,
+            pretrained_agents=pretrained_agents or {},
+            scoreboard=scoreboard,
+        )
+        # Inject redis + uuid into config (frozen, so use object.__setattr__)
+        object.__setattr__(self._config, "_redis", redis)
+        object.__setattr__(self._config, "_uuid",  self._uuid)
 
+    def run(self):
+        run(self._config, self._env)
 
-        self.streamer_mode = streamer_mode
-
-        self.current_agent = _unserialize_model(self.redis.get(MODEL_LATEST), device=device)
-
-        self.past_version_prob = past_version_prob
-        self.evaluation_prob = evaluation_prob
-        self.sigma_target = sigma_target
-        self.send_gamestates = send_gamestates
-        self.send_obs = send_obs
-        self.dynamic_gm = dynamic_gm
-        self.team_size = team_size
-        self.team_size_mutator = VariableTeamSizeMutator(mode_weights={})
-        self.gamemode_weights = gamemode_weights
-        if self.gamemode_weights is not None:
-            assert np.isclose(sum(self.gamemode_weights.values()), 1), "gamemode_weights must sum to 1"
-        self.gamemode_exp_per_episode_ema = {}
-        self.local_cache_name = local_cache_name
-
-        self.full_team_evaluations = full_team_evaluations
-
-        self.live_progress = live_progress
-
-        self.uuid = str(uuid4())
-        self.redis.rpush(WORKER_IDS, self.uuid)
-
-        # currently doesn't rebuild, if the old is there, reuse it.
-        if self.local_cache_name:
-            self.sql = sql.connect('redis-model-cache-' + local_cache_name + '.db')
-            # if the table doesn't exist in the database, make it
-            self.sql.execute("""
-                CREATE TABLE if not exists MODELS (
-                    id TEXT PRIMARY KEY,
-                    parameters BLOB NOT NULL
-                );
-            """)
-
-        if not self.streamer_mode:
-            print("Started worker", self.uuid, "on host", self.redis.connection_pool.connection_kwargs.get("host"),
-                  "under name", name)  # TODO log instead
-        else:
-            print("Streaming mode set. Running silent.")
-
-        self.scoreboard = scoreboard
-        self.env = env
-        # TODO state setter already set 
-        self.total_steps_generated = 0
-
-    def _get_opponent_ids(self, n_new, n_old, pretrained_choice):
-        # Get qualities
-        assert (n_new + n_old) % 2 == 0
-        per_team = (n_new + n_old) // 2
-        gamemode = f"{per_team}v{per_team}"
-        latest_id = self.redis.get(LATEST_RATING_ID).decode("utf-8")
-        latest_key = f"{latest_id}-stochastic"
-        if n_old == 0:
-            rating = get_rating(gamemode, latest_key, self.redis)
-            return [-1] * n_new, [rating] * n_new
-
-        ratings = get_rating(gamemode, None, self.redis)
-        latest_rating = ratings[latest_key]
-        keys, values = zip(*ratings.items())
-
-        is_eval = (n_new == 0 and len(values) >= n_old)
-        if is_eval:  # Evaluation game, try to find agents with high sigma
-            sigmas = np.array([r.sigma for r in values])
-            probs = np.clip(sigmas - self.sigma_target, a_min=0, a_max=None)
-            s = probs.sum()
-            if s == 0:  # No versions with high sigma available
-                if np.random.normal(0, self.sigma_target) > 1:
-                    # Some chance of doing a match with random versions, so they might correct themselves
-                    probs = np.ones_like(probs) / len(probs)
-                else:
-                    return [-1] * n_old, [latest_rating] * n_old
-            else:
-                probs /= s
-            versions = [keys[np.random.choice(len(keys), p=probs)]]
-            if self.full_team_evaluations:
-                versions = versions * per_team
-            target_rating = values[versions[0]]
-        elif pretrained_choice is not None:  # pretrained agent chosen, just need index generation
-            matchups = np.full((n_new + n_old), -1).tolist()
-            for i in range(n_old):
-                index = np.random.randint(0, n_new + n_old)
-                matchups[index] = 'na'
-            return matchups, ratings.values()
-        else:
-            if n_new == 0:  # Would-be evaluation game, but not enough agents
-                n_new = n_old
-                n_old = 0
-            versions = [-1] * n_new
-            target_rating = latest_rating
-
-        # Calculate 1v1 win prob against target
-        # All the agents included should hold their own (at least approximately)
-        # This is to prevent unrealistic scenarios,
-        # like for instance ratings of [100, 0] vs [100, 0], which is technically fair but not useful
-        probs = np.zeros(len(keys))
-        if n_new == 0 and self.full_team_evaluations:
-            for i, rating in enumerate(values):
-                if i == versions[0]:
-                    p = 0  # Don't add more of the same agent in evaluation matches
-                else:
-                    p = probability_NvsM([rating] * per_team, [target_rating] * per_team)
-                probs[i] = p * (1 - p)
-            probs /= probs.sum()
-            opponent = np.random.choice(len(probs), p=probs)
-            if np.random.random() < 0.5:  # Randomly do blue/orange
-                versions = versions + [opponent] * per_team
-            else:
-                versions = [opponent] * per_team + versions
-            return [keys[i] for i in versions], [values[i] for i in versions]
-        else:
-            for i, rating in enumerate(values):
-                if n_new == 0 and i == versions[0]:
-                    continue  # Don't add more of the same agent in evaluation matches
-                p = probability_NvsM([rating], [target_rating])
-                probs[i] = (p * (1 - p)) ** ((n_new + n_old) // 2)  # Be less lenient the more players there are
-            probs /= probs.sum()
-
-            old_versions = np.random.choice(len(probs), size=n_old - is_eval, p=probs, replace=True).tolist()
-            versions += old_versions
-
-            # Then calculate the full matchup, with just permutations of the selected versions (weighted by fairness)
-            matchups = []
-            qualities = []
-            for perm in itertools.permutations(versions):
-                it_ratings = [latest_rating if v == -1 else values[v] for v in perm]
-                mid = len(it_ratings) // 2
-                p = probability_NvsM(it_ratings[:mid], it_ratings[mid:])
-                if n_new == 0 and set(perm[:mid]) == set(perm[mid:]):  # Don't want team against team
-                    p = 0
-                matchups.append(perm)
-                qualities.append(p * (1 - p))  # From AlphaStar
-            qualities = np.array(qualities)
-            s = qualities.sum()
-            if s == 0:
-                return [-1] * (n_new + n_old), [latest_rating] * (n_new + n_old)
-            k = np.random.choice(len(matchups), p=qualities / s)
-            return [-1 if i == -1 else keys[i] for i in matchups[k]], \
-                   [latest_rating if i == -1 else values[i] for i in matchups[k]]
-
-    @functools.lru_cache(maxsize=8)
-    def _get_past_model(self, version):
-        # if version in local database, query from database
-        # if not, pull from REDIS and store in disk cache
-
-        if self.local_cache_name:
-            models = self.sql.execute("SELECT parameters FROM MODELS WHERE id == ?", (version,)).fetchall()
-            if len(models) == 0:
-                bytestream = self.redis.hget(OPPONENT_MODELS, version)
-                model = _unserialize_model(bytestream, self.device)
-
-                self.sql.execute('INSERT INTO MODELS (id, parameters) VALUES (?, ?)', (version, bytestream))
-                self.sql.commit()
-            else:
-                # should only ever be 1 version of parameters
-                assert len(models) <= 1
-                # stored as tuple due to sqlite,
-                assert len(models[0]) == 1
-
-                bytestream = models[0][0]
-                model = _unserialize_model(bytestream, self.device)
-        else:
-            model = _unserialize_model(self.redis.hget(OPPONENT_MODELS, version), self.device)
-
-        return model
-
-    def select_gamemode(self, equal_likelihood):
-        mode_exp = {m.decode("utf-8"): int(v) for m, v in self.redis.hgetall(EXPERIENCE_PER_MODE).items()}
-        modes = list(mode_exp.keys())
-        if equal_likelihood:
-            mode = np.random.choice(modes)
-        else:
-            dist = np.array(list(mode_exp.values())) + 1
-            dist = dist / dist.sum()
-            if self.gamemode_weights is None:
-                target_dist = np.ones(len(modes))
-            else:
-                target_dist = np.array([self.gamemode_weights[k] for k in modes])
-            mode_steps_per_episode = np.array(list(self.gamemode_exp_per_episode_ema.get(m, None) or 1 for m in modes))
-
-            target_dist = target_dist / mode_steps_per_episode
-            target_dist = target_dist / target_dist.sum()
-            inv_dist = 1 - dist
-            inv_dist = inv_dist / inv_dist.sum()
-
-            dist = target_dist * inv_dist
-            dist = dist / dist.sum()
-
-            mode = np.random.choice(modes, p=dist)
-
-        b, o = mode.split("v")
-        return int(b), int(o)
-
-    @staticmethod
-    def make_table(versions, ratings, blue, orange, pretrained_choice):
-        version_info = []
-        for v, r in zip(versions, ratings):
-            if pretrained_choice is not None and v == 'na':  # print name but don't send it back
-                version_info.append([str(type(pretrained_choice).__name__), "N/A"])
-            elif v == 'na':
-                version_info.append(['Human', "N/A"])
-            else:
-                if isinstance(v, int) and v < 0:
-                    v = f"Latest ({-v})"
-                version_info.append([v, f"{r.mu:.2f}±{2 * r.sigma:.2f}"])
-
-        blue_versions, blue_ratings = list(zip(*version_info[:blue]))
-        orange_versions, orange_ratings = list(zip(*version_info[blue:]))
-
-        if blue < orange:
-            blue_versions += [""] * (orange - blue)
-            blue_ratings += [""] * (orange - blue)
-        elif orange < blue:
-            orange_versions += [""] * (blue - orange)
-            orange_ratings += [""] * (blue - orange)
-
-        table_str = tabulate(list(zip(blue_versions, blue_ratings, orange_versions, orange_ratings)),
-                             headers=["Blue", "rating", "Orange", "rating"], tablefmt="rounded_outline")
-
-        return table_str
-
-    def run(self):  # Mimics Thread
-        """
-        begin processing in already launched match and push to redis
-        """
-        n = 0
-        latest_version = None
-        # t = Thread()
-        # t.start()
-        while True:
-            # Get the most recent version available
-            available_version = self.redis.get(VERSION_LATEST)
-            if available_version is None:
-                time.sleep(1)
-                continue  # Wait for version to be published (not sure if this is necessary?)
-            available_version = int(available_version)
-
-            # Only try to download latest version when new
-            if latest_version != available_version:
-                model_bytes = self.redis.get(MODEL_LATEST)
-                if model_bytes is None:
-                    time.sleep(1)
-                    continue  # This is maybe not necessary? Can't hurt to leave it in.
-                latest_version = available_version
-                updated_agent = _unserialize_model(model_bytes, self.device)
-                self.current_agent = updated_agent
-
-            n += 1
-            pretrained_choice = None
-
-            evaluate = np.random.random() < self.evaluation_prob
-
-            if self.dynamic_gm:
-                blue, orange = self.select_gamemode(equal_likelihood=evaluate or self.streamer_mode) 
-            else:
-                blue = orange = self.team_size
-
-            self.team_size_mutator.mode_weights = {
-               (blue, orange): 1
-            }
-
-            if isinstance(self.env, RLGym):
-                # Not wrapped yet
-                self.env.state_mutator = MutatorSequence(self.team_size_mutator, self.env.state_mutator)
-                self.env = RLGymV2GymWrapper(self.env)
-            
-            
-            agents, pretrained_choice, versions, ratings = self._generate_matchup(blue + orange,
-                                                                                      latest_version,
-                                                                                      pretrained_choice,
-                                                                                      evaluate)
-
-            evaluate = not any(isinstance(v, int) and v < 0 for v in versions)  # Might be changed in matchup code
-
-            table_str = self.make_table(versions, ratings, blue, orange, pretrained_choice)
-
-            if evaluate and not self.streamer_mode:
-                print("EVALUATION GAME\n" + table_str)
-                result = rocket_learn.utils.generate_episode.generate_episode(self.env, agents, evaluate=True,
-                                                                              scoreboard=self.scoreboard,
-                                                                              progress=self.live_progress)
-                rollouts = []
-                print("Evaluation finished, goal differential:", result)
-                print()
-            else:
-                if not self.streamer_mode:
-                    print("ROLLOUT\n" + table_str)
-
-                try:
-                    rollouts, result = rocket_learn.utils.generate_episode.generate_episode(self.env, agents,
-                                                                                            evaluate=False,
-                                                                                            scoreboard=self.scoreboard,
-                                                                                            progress=self.live_progress)
-
-                    if len(rollouts[0].observations) <= 1:  # Happens sometimes, unknown reason
-                        print(" ** Rollout Generation Error: Restarting Generation ** ")
-                        print()
-                        continue
-                except EnvironmentError:
-                    self.env.attempt_recovery()
-                    continue
-
-                state = rollouts[0].infos[-2]["state"]
-                goal_speed = np.linalg.norm(state.ball.linear_velocity) * 0.036  # kph
-                str_result = ('+' if result > 0 else "") + str(result)
-                episode_exp = len(rollouts[0].observations) * len(rollouts)
-                self.total_steps_generated += episode_exp
-
-                if self.dynamic_gm and not evaluate:
-                    mode = f"{blue}v{orange}"
-                    if mode in self.gamemode_exp_per_episode_ema:
-                        current_mean = self.gamemode_exp_per_episode_ema[mode]
-                        self.gamemode_exp_per_episode_ema[mode] = 0.98 * current_mean + 0.02 * episode_exp
-                    else:
-                        self.gamemode_exp_per_episode_ema[mode] = episode_exp
-
-                post_stats = f"Rollout finished after {len(rollouts[0].observations)} steps ({self.total_steps_generated} total steps), result was {str_result}"
-                if result != 0:
-                    post_stats += f", goal speed: {goal_speed:.2f} kph"
-
-                if not self.streamer_mode:
-                    print(post_stats)
-                    print()
-
-            if not self.streamer_mode:
-                rollout_data = encode_buffers(rollouts,
-                                              return_obs=self.send_obs,
-                                              return_rewards=True,
-                                              return_states=self.send_gamestates)
-
-                rollout_bytes = _serialize((rollout_data, versions, self.uuid, self.name, result,
-                                            self.send_obs, self.send_gamestates, True))
-
-                # while True:
-                # t.join()
-
-                def send():
-                    n_items = self.redis.rpush(ROLLOUTS, rollout_bytes)
-                    if n_items >= 1000:
-                        print("Had to limit rollouts. Learner may have have crashed, or is overloaded")
-                        self.redis.ltrim(ROLLOUTS, -100, -1)
-
-                send()
-                # t = Thread(target=send)
-                # t.start()
-                # time.sleep(0.01)
-
-    def _generate_matchup(self, n_agents, latest_version, pretrained_choice, evaluate):
-        if evaluate:
-            n_old = n_agents
-        else:
-            n_old = 0
-            rand_choice = np.random.random()
-            if rand_choice < self.past_version_prob:
-                n_old = np.random.randint(low=1, high=n_agents)
-            elif rand_choice < (self.past_version_prob + self.pretrained_total_prob):
-                wheel_prob = self.past_version_prob
-                for agent in self.pretrained_agents:
-                    wheel_prob += self.pretrained_agents[agent]
-                    if rand_choice < wheel_prob:
-                        pretrained_choice = agent
-                        n_old = np.random.randint(low=1, high=n_agents)
-                        break
-        n_new = n_agents - n_old
-        versions, ratings = self._get_opponent_ids(n_new, n_old, pretrained_choice)
-        agents = []
-        for version in versions:
-            if version == -1:
-                agents.append(self.current_agent)
-            elif pretrained_choice is not None and version == 'na':
-                agents.append(pretrained_choice)
-            else:
-                selected_agent = self._get_past_model("-".join(version.split("-")[:-1]))
-                if version.endswith("deterministic"):
-                    selected_agent.deterministic = True
-                elif version.endswith("stochastic"):
-                    selected_agent.deterministic = False
-                else:
-                    raise ValueError("Unknown version type")
-                agents.append(selected_agent)
-            if self.streamer_mode > 1:
-                agents[-1].deterministic = True
-        versions = [v if v != -1 else latest_version for v in versions]
-        return agents, pretrained_choice, versions, ratings
