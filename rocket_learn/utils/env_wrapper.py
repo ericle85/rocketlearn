@@ -40,7 +40,7 @@ class RLGymV2GymWrapper(object):
             idx += 1
 
         self.obs_buffer = np.asarray(obs_vec)
-        return self.obs_buffer
+        return self.obs_buffer.copy()
 
     def step(self, actions):
         if self.is_discrete:
@@ -66,7 +66,7 @@ class RLGymV2GymWrapper(object):
             idx += 1
 
         info = {"state": self.rlgym_env.state}
-        return self.obs_buffer, rews, done, truncated, info
+        return self.obs_buffer.copy(), rews, done, truncated, info
 
     def render(self):
         self.rlgym_env.render()
