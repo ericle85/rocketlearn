@@ -24,9 +24,9 @@ from tabulate import tabulate
 import rocket_learn.utils.generate_episode
 from rocket_learn.agent.pretrained_policy import HardcodedAgent
 from rocket_learn.rollout_generator.redis.utils import (
-    EXPERIENCE_PER_MODE, LATEST_RATING_ID, MODEL_LATEST, OPPONENT_MODELS,
-    QUALITIES, ROLLOUTS, VERSION_LATEST, WORKER_IDS,
+    EXPERIENCE_PER_MODE, MAX_QUEUE, OPPONENT_MODELS, WORKER_IDS,
     _serialize, _unserialize_model, encode_buffers, get_rating,
+    io_fetch_latest, io_push_rollout, parse_model_id,
 )
 from rocket_learn.utils.env_wrapper import RLGymV2GymWrapper
 from rocket_learn.utils.util import probability_NvsM
@@ -214,18 +214,18 @@ def format_post_stats(
 # I/O functions
 # ---------------------------------------------------------------------------
 
-def io_fetch_latest_model(redis: Redis, device: str, current_version: Optional[int]):
-    """Returns (version, model) if a new version is available, else (current_version, None)."""
-    available = redis.get(VERSION_LATEST)
-    if available is None:
-        return current_version, None
-    available = int(available)
-    if available == current_version:
-        return current_version, None
-    model_bytes = redis.get(MODEL_LATEST)
-    if model_bytes is None:
-        return current_version, None
-    return available, _unserialize_model(model_bytes, device)
+def io_fetch_latest_model(redis: Redis, device: str, current_model_id: Optional[str]):
+    latest = io_fetch_latest(redis)
+    if latest is None or latest[0] == current_model_id:
+        return current_model_id, None
+    model_id, model_bytes = latest
+    assert parse_model_id(model_id)
+    return model_id, _unserialize_model(model_bytes, device)
+
+
+def build_rollout_payload(model_id: str, rollout_data, versions: List, uuid: str, name: str,
+                          result: int, send_obs: bool, send_gamestates: bool) -> Tuple:
+    return (model_id, rollout_data, versions, uuid, name, result, send_obs, send_gamestates, True)
 
 
 def io_read_mode_experience(redis: Redis) -> Dict[str, int]:
@@ -237,29 +237,8 @@ def io_increment_mode_experience(redis: Redis, mode: str, exp: int) -> None:
 
 
 def io_init_mode_experience(redis: Redis, team_size: int) -> None:
-    from trueskill import Rating as TrueSkillRating
-    latest_id = redis.get(LATEST_RATING_ID)
-    if latest_id is None:
-        raise RuntimeError("Learner has not initialized Redis yet (LATEST_RATING_ID missing). "
-                           "Start the learner before workers.")
-    latest_id = latest_id.decode()
     for i in range(1, team_size + 1):
-        mode = f"{i}v{i}"
-        if not redis.hexists(EXPERIENCE_PER_MODE, mode):
-            redis.hset(EXPERIENCE_PER_MODE, mode, 0)
-        quality_key = QUALITIES.format(mode)
-        for suffix in ("stochastic", "deterministic"):
-            key = f"{latest_id}-{suffix}"
-            if not redis.hexists(quality_key, key):
-                default = TrueSkillRating()
-                redis.hset(quality_key, key, _serialize([default.mu, default.sigma]))
-
-
-def io_push_rollout(redis: Redis, rollout_bytes: bytes) -> None:
-    n_items = redis.rpush(ROLLOUTS, rollout_bytes)
-    if n_items >= 1000:
-        print("Had to limit rollouts. Learner may have crashed or is overloaded")
-        redis.ltrim(ROLLOUTS, -100, -1)
+        redis.hsetnx(EXPERIENCE_PER_MODE, f"{i}v{i}", 0)
 
 
 def io_get_ratings(redis: Redis, gamemode: str, model_id: Optional[str]):
@@ -268,7 +247,7 @@ def io_get_ratings(redis: Redis, gamemode: str, model_id: Optional[str]):
 
 def io_build_past_model_loader(redis: Redis, device: str, local_cache_name: Optional[str]):
     """
-    Returns a cached loader function: version_base_str -> model.
+    Returns a cached loader function: model_id -> model.
     Encapsulates SQLite caching so callers stay pure.
     """
     db = None
@@ -282,19 +261,20 @@ def io_build_past_model_loader(redis: Redis, device: str, local_cache_name: Opti
         """)
 
     @lru_cache(maxsize=8)
-    def load(version: str):
+    def load(model_id: str):
+        assert parse_model_id(model_id)
         if db is not None:
             rows = db.execute(
-                "SELECT parameters FROM MODELS WHERE id = ?", (version,)
+                "SELECT parameters FROM MODELS WHERE id = ?", (model_id,)
             ).fetchall()
             if rows:
                 return _unserialize_model(rows[0][0], device)
-            bytestream = redis.hget(OPPONENT_MODELS, version)
+            bytestream = redis.hget(OPPONENT_MODELS, model_id)
             db.execute("INSERT INTO MODELS (id, parameters) VALUES (?, ?)",
-                       (version, bytestream))
+                       (model_id, bytestream))
             db.commit()
             return _unserialize_model(bytestream, device)
-        return _unserialize_model(redis.hget(OPPONENT_MODELS, version), device)
+        return _unserialize_model(redis.hget(OPPONENT_MODELS, model_id), device)
 
     return load
 
@@ -315,7 +295,7 @@ def build_matchup(
     current_agent,
     load_past_model,
     n_agents: int,
-    latest_version: int,
+    latest_model_id: str,
     evaluate: bool,
     past_version_prob: float,
     pretrained_agents: Dict,
@@ -324,7 +304,7 @@ def build_matchup(
 ) -> Tuple[List, List, List, bool]:
     """
     Returns (agents, versions, ratings, is_evaluate).
-    Versions use latest_version int (not -1) for latest agent slots.
+    Versions use latest_model_id for latest agent slots.
     """
     per_team = n_agents // 2
     gamemode = f"{per_team}v{per_team}"
@@ -334,8 +314,7 @@ def build_matchup(
     )
     n_new = n_agents - n_old
 
-    latest_id  = redis.get(LATEST_RATING_ID).decode()
-    latest_key = f"{latest_id}-stochastic"
+    latest_key = f"{latest_model_id}-stochastic"
 
     # All-latest game
     if n_old == 0:
@@ -343,7 +322,7 @@ def build_matchup(
         ratings = [rating] * n_new
         agents   = [current_agent] * n_new
         has_latest = True
-        return agents, [latest_version] * n_new, ratings, not has_latest
+        return agents, [latest_model_id] * n_new, ratings, not has_latest
 
     all_ratings = io_get_ratings(redis, gamemode, None)
     latest_rating = all_ratings[latest_key]
@@ -404,7 +383,7 @@ def build_matchup(
     for v in fair_versions:
         if v == -1:
             agents.append(current_agent)
-            resolved_versions.append(latest_version)
+            resolved_versions.append(latest_model_id)
         elif pretrained_choice is not None and v == "na":
             agents.append(pretrained_choice)
             resolved_versions.append("na")
@@ -416,7 +395,7 @@ def build_matchup(
             agents.append(model)
             resolved_versions.append(key)
 
-    has_latest  = latest_version in resolved_versions
+    has_latest  = latest_model_id in resolved_versions
     is_evaluate = not has_latest
     return agents, resolved_versions, fair_ratings, is_evaluate
 
@@ -432,20 +411,19 @@ def run(config: WorkerConfig, env: RLGym) -> None:
     team_size_mutator = VariableTeamSizeMutator(mode_weights={})
     wrapped_env       = io_build_env(env, team_size_mutator, config.team_size)
 
-    if config.dynamic_gm:
-        io_init_mode_experience(redis, config.team_size)
-
-    current_version: Optional[int] = None
-    current_agent                  = None
-    total_steps                    = 0
+    current_model_id: Optional[str] = None
+    current_agent                   = None
+    total_steps                     = 0
 
     while True:
         # --- fetch latest model if updated ---
-        current_version, new_agent = io_fetch_latest_model(
-            redis, config.device, current_version
+        current_model_id, new_agent = io_fetch_latest_model(
+            redis, config.device, current_model_id
         )
         if new_agent is not None:
             current_agent = new_agent
+            if config.dynamic_gm:
+                io_init_mode_experience(redis, config.team_size)
         if current_agent is None:
             time.sleep(1)
             continue
@@ -466,7 +444,7 @@ def run(config: WorkerConfig, env: RLGym) -> None:
             current_agent  = current_agent,
             load_past_model= load_past_model,
             n_agents       = blue + orange,
-            latest_version = current_version,
+            latest_model_id = current_model_id,
             evaluate       = evaluate,
             past_version_prob   = config.past_version_prob,
             pretrained_agents   = config.pretrained_agents,
@@ -489,8 +467,8 @@ def run(config: WorkerConfig, env: RLGym) -> None:
                 progress=config.live_progress,
                 render=config.render,
             )
-            rollouts = []
             print(f"Evaluation finished, goal differential: {result}\n")
+            continue
         else:
             print("ROLLOUT\n" + table)
             try:
@@ -525,10 +503,12 @@ def run(config: WorkerConfig, env: RLGym) -> None:
                                        return_obs=config.send_obs,
                                        return_rewards=True,
                                        return_states=config.send_gamestates)
-        rollout_bytes = _serialize((rollout_data, versions, config._uuid,
-                                    config.name, result,
-                                    config.send_obs, config.send_gamestates, True))
-        io_push_rollout(redis, rollout_bytes)
+        assert current_model_id in versions
+        rollout_bytes = _serialize(build_rollout_payload(
+            current_model_id, rollout_data, versions, config._uuid, config.name,
+            result, config.send_obs, config.send_gamestates))
+        if io_push_rollout(redis, rollout_bytes) >= MAX_QUEUE:
+            print("Had to limit rollouts. Learner may have crashed or is overloaded")
 
 
 # ---------------------------------------------------------------------------

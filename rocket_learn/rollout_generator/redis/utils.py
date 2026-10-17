@@ -1,7 +1,8 @@
 # Constants for consistent key lookup
 import pickle
 import zlib
-from typing import List, Optional, Union, Dict
+from typing import List, Optional, Union, Dict, Tuple
+from uuid import uuid4
 
 import numpy as np
 from redis import Redis
@@ -19,7 +20,6 @@ N_UPDATES = "num-updates"
 # MODEL_FREQ = "model-freq"
 
 MODEL_LATEST = "model-latest"
-VERSION_LATEST = "model-version"
 
 ROLLOUTS = "rollout"
 OPPONENT_MODELS = "opponent-models"
@@ -28,10 +28,61 @@ CONTRIBUTORS = "contributors"
 LATEST_RATING_ID = "latest-rating-id"
 EXPERIENCE_PER_MODE = "experience-per-mode"
 _ALL = (
-    N_UPDATES, MODEL_LATEST, VERSION_LATEST, ROLLOUTS, OPPONENT_MODELS,
+    N_UPDATES, MODEL_LATEST, ROLLOUTS, OPPONENT_MODELS,
     WORKER_IDS, CONTRIBUTORS, LATEST_RATING_ID, EXPERIENCE_PER_MODE)
 
+MAX_QUEUE = 1000
+
 m.patch()
+
+
+def make_model_id(run_id: str, version: int) -> str:
+    return f"{run_id}-{version}"
+
+
+def parse_model_id(model_id: str) -> Tuple[str, int]:
+    run_id, version = model_id.rsplit("-", 1)
+    return run_id, int(version)
+
+
+def io_fetch_latest(redis: Redis) -> Optional[Tuple[str, bytes]]:
+    blob = redis.get(MODEL_LATEST)
+    return None if blob is None else tuple(_unserialize(blob))
+
+
+def _queue_publish(pipe, model_id: str, model_bytes: bytes, gamemodes: Tuple[str, ...]):
+    default = _serialize([Rating().mu, Rating().sigma])
+    seeded = pipe.set(MODEL_LATEST, _serialize([model_id, model_bytes])) \
+                 .hset(OPPONENT_MODELS, model_id, model_bytes) \
+                 .set(LATEST_RATING_ID, model_id)
+    for mode in gamemodes:
+        for suffix in ("stochastic", "deterministic"):
+            seeded = seeded.hsetnx(QUALITIES.format(mode), f"{model_id}-{suffix}", default)
+    return seeded
+
+
+def io_publish_model(redis: Redis, model_id: str, model_bytes: bytes,
+                     gamemodes: Tuple[str, ...] = ()) -> None:
+    _queue_publish(redis.pipeline(transaction=True), model_id, model_bytes, gamemodes).execute()
+
+
+def io_start_new_run(redis: Redis, model_bytes: bytes, gamemodes: Tuple[str, ...] = ()) -> str:
+    model_id = make_model_id(uuid4().hex, 0)
+    _queue_publish(redis.pipeline(transaction=True).flushdb(), model_id, model_bytes, gamemodes).execute()
+    return model_id
+
+
+def io_push_rollout(redis: Redis, rollout_bytes: bytes) -> int:
+    n_items, _ = (redis.pipeline(transaction=True)
+                  .rpush(ROLLOUTS, rollout_bytes)
+                  .ltrim(ROLLOUTS, -MAX_QUEUE, -1)
+                  .execute())
+    return n_items
+
+
+def io_pop_rollout(redis: Redis, timeout: float) -> Optional[bytes]:
+    popped = redis.blpop([ROLLOUTS], timeout=timeout)
+    return None if popped is None else popped[1]
 
 
 # Helper methods for easier changing of byte conversion
