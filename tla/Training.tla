@@ -46,10 +46,20 @@ FetchModel(w) ==
 
 PickOpponent(w) ==
     /\ workerStep[w] = "pickOpponent"
+    /\ workerModel[w] \in redisOpponentPool
     /\ \E opponent \in redisOpponentPool :
         workerOpponent' = [workerOpponent EXCEPT ![w] = opponent]
     /\ workerStep' = [workerStep EXCEPT ![w] = "playAndPush"]
     /\ UNCHANGED <<workerModel>>
+    /\ UNCHANGED redisVars
+    /\ UNCHANGED learnerVars
+    /\ UNCHANGED crashCount
+
+AbandonDeadRun(w) ==
+    /\ workerStep[w] = "pickOpponent"
+    /\ workerModel[w] \notin redisOpponentPool
+    /\ workerStep' = [workerStep EXCEPT ![w] = "fetchModel"]
+    /\ UNCHANGED <<workerModel, workerOpponent>>
     /\ UNCHANGED redisVars
     /\ UNCHANGED learnerVars
     /\ UNCHANGED crashCount
@@ -113,13 +123,13 @@ LearnerCrashAndStartNewRun ==
     /\ UNCHANGED workerVars
 
 Next ==
-    \/ \E w \in Workers : FetchModel(w) \/ PickOpponent(w) \/ PlayAndPush(w) \/ WorkerCrashAndRestart(w)
+    \/ \E w \in Workers : FetchModel(w) \/ PickOpponent(w) \/ AbandonDeadRun(w) \/ PlayAndPush(w) \/ WorkerCrashAndRestart(w)
     \/ PopRollout
     \/ TrainAndPublish
     \/ LearnerCrashAndStartNewRun
 
 Fairness ==
-    /\ \A w \in Workers : WF_vars(FetchModel(w) \/ PickOpponent(w) \/ PlayAndPush(w))
+    /\ \A w \in Workers : WF_vars(FetchModel(w) \/ PickOpponent(w) \/ AbandonDeadRun(w) \/ PlayAndPush(w))
     /\ WF_vars(PopRollout)
     /\ WF_vars(TrainAndPublish)
 

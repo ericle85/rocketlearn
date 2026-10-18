@@ -270,11 +270,14 @@ def io_build_past_model_loader(redis: Redis, device: str, local_cache_name: Opti
             if rows:
                 return _unserialize_model(rows[0][0], device)
             bytestream = redis.hget(OPPONENT_MODELS, model_id)
+            if bytestream is None:
+                return None
             db.execute("INSERT INTO MODELS (id, parameters) VALUES (?, ?)",
                        (model_id, bytestream))
             db.commit()
             return _unserialize_model(bytestream, device)
-        return _unserialize_model(redis.hget(OPPONENT_MODELS, model_id), device)
+        bytestream = redis.hget(OPPONENT_MODELS, model_id)
+        return None if bytestream is None else _unserialize_model(bytestream, device)
 
     return load
 
@@ -301,7 +304,7 @@ def build_matchup(
     pretrained_agents: Dict,
     sigma_target: float,
     full_team_evaluations: bool,
-) -> Tuple[List, List, List, bool]:
+) -> Optional[Tuple[List, List, List, bool]]:
     """
     Returns (agents, versions, ratings, is_evaluate).
     Versions use latest_model_id for latest agent slots.
@@ -319,12 +322,16 @@ def build_matchup(
     # All-latest game
     if n_old == 0:
         rating  = io_get_ratings(redis, gamemode, latest_key)
+        if rating is None:
+            return None
         ratings = [rating] * n_new
         agents   = [current_agent] * n_new
         has_latest = True
         return agents, [latest_model_id] * n_new, ratings, not has_latest
 
     all_ratings = io_get_ratings(redis, gamemode, None)
+    if latest_key not in all_ratings:
+        return None
     latest_rating = all_ratings[latest_key]
     keys   = list(all_ratings.keys())
     values = list(all_ratings.values())
@@ -391,6 +398,8 @@ def build_matchup(
             key    = keys[v] if isinstance(v, int) else v
             base   = "-".join(key.split("-")[:-1])
             model  = load_past_model(base)
+            if model is None:
+                return None
             model.deterministic = key.endswith("deterministic")
             agents.append(model)
             resolved_versions.append(key)
@@ -439,7 +448,7 @@ def run(config: WorkerConfig, env: RLGym) -> None:
 
         # --- build matchup ---
         evaluate = np.random.random() < config.evaluation_prob
-        agents, versions, ratings, evaluate = build_matchup(
+        matchup = build_matchup(
             redis          = redis,
             current_agent  = current_agent,
             load_past_model= load_past_model,
@@ -451,6 +460,9 @@ def run(config: WorkerConfig, env: RLGym) -> None:
             sigma_target        = config.sigma_target,
             full_team_evaluations = config.full_team_evaluations,
         )
+        if matchup is None:
+            continue
+        agents, versions, ratings, evaluate = matchup
 
         pretrained_choice = next(
             (a for a in agents if isinstance(a, HardcodedAgent)), None

@@ -112,7 +112,7 @@ def _unserialize_model(buf, device: str):
     return agent
 
 
-def get_rating(gamemode: str, model_id: Optional[str], redis: Redis) -> Union[Rating, Dict[str, Rating]]:
+def get_rating(gamemode: str, model_id: Optional[str], redis: Redis) -> Union[Optional[Rating], Dict[str, Rating]]:
     """
     Get the rating of a player.
     :param gamemode: The game mode to get the rating for.
@@ -126,7 +126,8 @@ def get_rating(gamemode: str, model_id: Optional[str], redis: Redis) -> Union[Ra
             k.decode("utf-8"): Rating(*_unserialize(v))
             for k, v in redis.hgetall(quality_key).items()
         }
-    return Rating(*_unserialize(redis.hget(quality_key, model_id)))
+    rating = redis.hget(quality_key, model_id)
+    return None if rating is None else Rating(*_unserialize(rating))
 
 
 def encode_buffers(buffers: List[ExperienceBuffer], return_obs=True, return_rewards=True, return_states=False):
